@@ -7,6 +7,12 @@
   <version>0.1.0</version>
   <name>QueryWarden</name>
   <description>Text-to-SQL agent with layered guardrails on PostgreSQL</description>
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+    </license>
+  </licenses>
 
   <properties>
     <maven.compiler.release>21</maven.compiler.release>

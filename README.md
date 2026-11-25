@@ -882,6 +882,7 @@ variables, except in `eval`.
 
 ```
 .github/workflows/tests.yml  runs all tests on GitHub on every push
+LICENSE                 MIT License
 pom.xml                 Maven build (Java 21)
 policy.yaml             the demo's rules: tables, blocked/masked columns, definitions, metrics, limits
 eval/
@@ -969,3 +970,11 @@ Other notes:
 - The SQL prompt (schema + rules) is cached, so repeated questions cost less.
 - Server-side refusal fallbacks are used where the model supports them (Opus 5.5, Sonnet 5.5 and the
   Fable models; not Haiku 5.5). Turn them off with `--no-fallbacks`.
+
+## License
+
+QueryWarden is released under the [MIT License](LICENSE). You may use, change and share it, including
+commercially, as long as the copyright and licence notice stay with it. It comes with no warranty.
+
+The bundled Chart.js (`src/main/resources/web/vendor/chart.umd.min.js`) is © Chart.js Contributors,
+also under the MIT License; its notice is kept at the top of the file.
