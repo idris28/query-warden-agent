@@ -1,0 +1,43 @@
+# QueryWarden policy: what the agent may see and do.
+#
+# Edit this file to point QueryWarden at your own data. No rebuild is needed.
+# Check the result with:   java -jar target/querywarden.jar policy
+#
+# Names are case-insensitive. Unknown keys are an error, so typos can't silently
+# switch a protection off. Anything left out keeps its built-in default.
+#
+# This file only controls QueryWarden's own checks and masking. For full protection,
+# the database user that runs the queries must have matching permissions
+# (see "Using your real database" in README.md).
+
+# The PostgreSQL schema the tables live in (often "public").
+schema: shop
+
+# Tables Claude may query. Everything else is invisible and blocked.
+allowed_tables:
+  - customers
+  - products
+  - orders
+  - order_items
+  - employees
+
+# Columns that must never be read, per table: not shown to Claude, not allowed
+# anywhere in a query (SELECT, WHERE, ORDER BY, ...), and SELECT * is refused on these tables.
+blocked_columns:
+  employees: [salary, ssn]
+
+# Columns that may be used but are shown as *** in results (matched by column name).
+# Values that look like emails, phone numbers, SSNs or secret keys are also hidden.
+masked_columns: [email, phone]
+
+# Extra functions to block, on top of the built-in list of dangerous PostgreSQL
+# functions (pg_sleep, pg_read_file, set_config, dblink, ...), which always applies.
+blocked_functions: []
+
+limits:
+  max_rows: 200             # results are cut to this many rows
+  timeout_ms: 3000          # each query is cancelled after this long
+  max_joins: 4              # JOINs allowed in one query
+  max_selects: 6            # SELECT blocks (subqueries, CTEs, UNION parts) in one query
+  max_question_chars: 1000  # longest question accepted
+  max_sql_chars: 4000       # longest SQL accepted

@@ -123,8 +123,8 @@ Each layer works on its own, so one mistake doesn't leak data:
 Postgres can only allow or deny access to a table or column. Masking (reading a column but showing
 a disguised value) is done by QueryWarden's own code, not by Postgres.
 
-All the rules come from one file, `Policy.java`: allowed tables, blocked columns, masked columns,
-blocked functions and limits.
+All the rules come from one file, [`policy.yaml`](policy.yaml): allowed tables, blocked columns,
+masked columns, extra blocked functions and limits. See [The policy file](#the-policy-file).
 
 ## Quick start (demo database)
 
@@ -136,7 +136,7 @@ Start Postgres 16 on `localhost:5433`:
 docker compose up -d --wait
 ```
 
-Build the app (also runs the 77 tests):
+Build the app (also runs the 97 tests):
 
 ```bash
 mvn -q package
@@ -173,7 +173,9 @@ java -jar target/querywarden.jar ask "Top 5 customers by total spend on delivere
 | `repl` | Interactive mode: keep asking questions (Ctrl-D to exit) |
 | `check "SQL"` | Run your own SQL through the checks and the database, without Claude |
 | `schema` | Show exactly what Claude sees about your database |
+| `policy` | Show the policy in effect and which file it came from |
 | `setup` | **Demo only.** Creates the sample `shop` data and the `qw_agent` user. Refuses to run on a database that doesn't look like a demo database |
+| `--policy FILE` | Option for any command: use this policy file instead of `./policy.yaml` |
 | `--no-fallbacks` | Option for `ask`/`repl`: turn off server-side refusal fallbacks |
 
 Stop the demo database with `docker compose down`. It keeps no data volume, so the next
@@ -215,7 +217,7 @@ QueryWarden supports **PostgreSQL** only. Other databases would need code change
 prompt wording, blocked-function list, timeout handling, error codes).
 
 > ⚠️ **Skip `setup` on a real database.** It is for the demo only: it drops and recreates the schema
-> named in `Policy.java`, fills it with fake data, and changes database-wide permissions.
+> named in `policy.yaml`, fills it with fake data, and changes database-wide permissions.
 >
 > As a safeguard, `setup` refuses to run (exit code 3, nothing changed) unless the database looks
 > like a dedicated demo database:
@@ -231,14 +233,15 @@ prompt wording, blocked-function list, timeout handling, error codes).
 **1. Prefer a read replica or a copy.** The agent only reads, but a replica means even a slow query
 can't affect your live application.
 
-**2. Edit `Policy.java`** to describe your data:
+**2. Edit [`policy.yaml`](policy.yaml)** to describe your data (no rebuild needed):
 
 - `schema`: your schema name (often `public`)
-- `allowedTables`: tables Claude may use
-- `blockedColumns`: columns that must never be read (salaries, tokens, …)
-- `maskedColumns`: columns that may be read but are hidden in output (email, phone, …)
+- `allowed_tables`: tables Claude may use
+- `blocked_columns`: columns that must never be read (salaries, tokens, …)
+- `masked_columns`: columns that may be read but are hidden in output (email, phone, …)
 
-Then rebuild with `mvn -q package`.
+Then check it with `java -jar target/querywarden.jar policy`. Keep a separate file per database
+if you like, and choose one with `--policy FILE` or `QW_POLICY`.
 
 **3. Create a read-only database user.** Run as an admin in `psql`, replacing the placeholders:
 
@@ -298,6 +301,41 @@ java -jar target/querywarden.jar ask "your first question"
 Table and column names alone can be sensitive (for example a table called `layoff_candidates`).
 For company data, confirm that sending schema details to the Anthropic API fits your data policy.
 
+## The policy file
+
+QueryWarden looks for its policy in this order:
+
+1. the file given with `--policy FILE`
+2. the file in the `QW_POLICY` environment variable
+3. `policy.yaml` in the current directory
+4. built-in defaults for the demo database (the shipped `policy.yaml` is identical)
+
+Every command prints which one it used, e.g. `policy: policy.yaml`.
+
+```yaml
+schema: shop
+allowed_tables: [customers, products, orders, order_items, employees]
+blocked_columns:
+  employees: [salary, ssn]
+masked_columns: [email, phone]
+blocked_functions: []        # extras; the built-in dangerous-function list always applies
+limits:
+  max_rows: 200
+  timeout_ms: 3000
+  max_joins: 4
+  max_selects: 6
+  max_question_chars: 1000
+  max_sql_chars: 4000
+```
+
+- Keys you leave out keep their default values.
+- **Unknown keys are an error** (exit code 4), so a typo such as `blocked_column` can't silently
+  switch a protection off. Out-of-range limits and invalid names are rejected the same way.
+- `blocked_functions` only **adds** to the built-in list of dangerous PostgreSQL functions
+  (`pg_sleep`, `pg_read_file`, `set_config`, `dblink`, …). It can't remove any.
+- The policy controls QueryWarden's checks, masking and what Claude is shown. On a real database,
+  give the agent's database user matching permissions too, so Postgres enforces the same rules.
+
 ## Configuration
 
 | Variable | Default | Used for |
@@ -306,6 +344,7 @@ For company data, confirm that sending schema details to the Anthropic API fits 
 | `QW_DB_URL` | `jdbc:postgresql://localhost:5432/shop` | Database connection |
 | `QW_AGENT_USER` / `QW_AGENT_PASSWORD` | `qw_agent` / `qw_agent_dev` | The read-only user every query runs as (change the password outside local demos) |
 | `QW_ADMIN_USER` / `QW_ADMIN_PASSWORD` | `postgres` / `postgres` | Only used by `setup` |
+| `QW_POLICY` | none | Policy file to use when `--policy` isn't given (otherwise `./policy.yaml`) |
 
 ## Limitations
 
@@ -322,6 +361,7 @@ For company data, confirm that sending schema details to the Anthropic API fits 
 
 ```
 pom.xml                 Maven build (Java 21)
+policy.yaml             the rules: allowed tables, blocked/masked columns, limits
 docker-compose.yml      local Postgres 16 for the demo
 src/main/java/dev/querywarden/
   Main.java             command-line interface
@@ -331,11 +371,12 @@ src/main/java/dev/querywarden/
   SqlValidator.java     SQL checks before execution
   SafeExecutor.java     runs SQL as the read-only user; masking
   Database.java         demo setup and schema description
-  Policy.java           all the rules in one place
+  Policy.java           loads and checks policy.yaml; built-in defaults
 src/test/java/dev/querywarden/
   SqlValidatorTest.java       SQL check tests (no database)
   PostgresGuardrailsTest.java database and agent tests (Testcontainers)
   SetupSafetyTest.java        setup refuses non-demo databases (Testcontainers)
+  PolicyTest.java             loading and checking policy files
 ```
 
 ## Model notes

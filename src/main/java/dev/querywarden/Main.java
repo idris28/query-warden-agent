@@ -15,21 +15,47 @@ import java.util.List;
  *   querywarden repl                       interactive mode
  *   querywarden check "SELECT ..."         run guardrails + execution on raw SQL (no LLM)
  *   querywarden schema                     print the schema the model sees
+ *   querywarden policy                     print the policy in effect
  * </pre>
- * Options: --no-fallbacks (disable server-side refusal fallbacks)
+ * Options: --policy FILE (default: $QW_POLICY, then ./policy.yaml, then built-in defaults),
+ *          --no-fallbacks (disable server-side refusal fallbacks)
  */
 public final class Main {
 
     public static void main(String[] argv) throws Exception {
         List<String> args = new ArrayList<>(Arrays.asList(argv));
         boolean fallbacks = !args.remove("--no-fallbacks");
+        String policyPath = null;
+        int i = args.indexOf("--policy");
+        if (i >= 0) {
+            if (i + 1 >= args.size()) {
+                System.err.println("--policy needs a file path, e.g. --policy policy.yaml");
+                System.exit(4);
+            }
+            policyPath = args.get(i + 1);
+            args.subList(i, i + 2).clear();
+        }
         String cmd = args.isEmpty() ? "help" : args.remove(0);
         String rest = String.join(" ", args);
+        if (!List.of("setup", "schema", "check", "ask", "repl", "policy").contains(cmd)) {
+            System.out.println(USAGE);
+            return;
+        }
 
         Database.Config cfg = Database.Config.fromEnv();
-        Policy policy = Policy.defaults();
+        Policy policy;
+        try {
+            Policy.Loaded loaded = Policy.resolve(policyPath);
+            policy = loaded.policy();
+            System.err.println("policy: " + loaded.source());
+        } catch (Policy.PolicyException e) {
+            System.err.println("Invalid policy: " + e.getMessage());
+            System.exit(4);
+            return;
+        }
 
         switch (cmd) {
+            case "policy" -> System.out.print(policy.toYaml());
             case "setup" -> {
                 try {
                     Database.setup(cfg, policy);
@@ -49,7 +75,7 @@ public final class Main {
             }
             case "repl" -> {
                 QueryWardenAgent agent = agent(cfg, policy, fallbacks);
-                System.out.println("Ask a question about the shop database (Ctrl-D to exit).");
+                System.out.println("Ask a question about the database (Ctrl-D to exit).");
                 BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
                 while (true) {
                     System.out.print("\n> ");
@@ -58,12 +84,14 @@ public final class Main {
                     if (!line.isBlank()) print(agent.ask(line.strip()));
                 }
             }
-            default -> System.out.println("""
-                    usage: querywarden <setup|schema|ask|repl|check> [text] [--no-fallbacks]
-                    env:   QW_DB_URL, QW_ADMIN_USER, QW_ADMIN_PASSWORD, QW_AGENT_USER, QW_AGENT_PASSWORD,
-                           ANTHROPIC_API_KEY""");
+            default -> System.out.println(USAGE);
         }
     }
+
+    private static final String USAGE = """
+            usage: querywarden <setup|schema|policy|ask|repl|check> [text] [--policy FILE] [--no-fallbacks]
+            env:   QW_DB_URL, QW_ADMIN_USER, QW_ADMIN_PASSWORD, QW_AGENT_USER, QW_AGENT_PASSWORD,
+                   QW_POLICY, ANTHROPIC_API_KEY""";
 
     private static QueryWardenAgent agent(Database.Config cfg, Policy policy, boolean fallbacks) throws Exception {
         return new QueryWardenAgent(cfg, policy, new ClaudeSqlGenerator(fallbacks), 3, Path.of("audit.jsonl"));
