@@ -1,15 +1,18 @@
 package dev.querywarden;
 
-import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.sql.DataSource;
 
 /**
  * Runs validated SQL as the least-privilege agent role. PostgreSQL enforces the policy on its own,
@@ -36,8 +39,14 @@ public final class SafeExecutor {
         public String code() { return code; }
     }
 
-    public record QueryResult(List<String> columns, List<List<Object>> rows, boolean truncated,
-                              long elapsedMillis, int redactions) {}
+    /**
+     * Query output. Values are JSON-friendly: numbers stay numbers ({@code BigDecimal}, {@code Long}, …),
+     * dates and times become ISO text ({@code 2025-08-21}), masked values become {@code "***"}.
+     * {@code columnTypes} holds one of {@code number}, {@code date}, {@code datetime}, {@code boolean},
+     * {@code text} per column.
+     */
+    public record QueryResult(List<String> columns, List<String> columnTypes, List<List<Object>> rows,
+                              boolean truncated, long elapsedMillis, int redactions) {}
 
     private static final List<Object[]> PII = List.of(
             new Object[]{Pattern.compile("[\\w.+-]+@[\\w-]+\\.[\\w.-]+"), "<email>"},
@@ -46,16 +55,22 @@ public final class SafeExecutor {
             new Object[]{Pattern.compile("\\(?\\b\\d{3}\\)?[\\s.-]\\d{3}[\\s.-]\\d{4}\\b"), "<phone>"},
             new Object[]{Pattern.compile("\\bsk_(live|test)_\\w+"), "<secret>"});
 
-    private final Database.Config config;
+    private final DataSource agentConnections;
     private final Policy policy;
 
+    /** Opens a new connection per query. Fine for the command line. */
     public SafeExecutor(Database.Config config, Policy policy) {
-        this.config = config;
+        this(config.agentDataSource(), policy);
+    }
+
+    /** Uses the given connections (e.g. a pool for the web server). They must log in as the agent user. */
+    public SafeExecutor(DataSource agentConnections, Policy policy) {
+        this.agentConnections = agentConnections;
         this.policy = policy;
     }
 
     public QueryResult execute(String sql) throws ExecutionException {
-        try (Connection c = config.agent()) {
+        try (Connection c = agentConnections.getConnection()) {
             c.setAutoCommit(false);
             c.setReadOnly(true);
             try (Statement st = c.createStatement()) {
@@ -66,6 +81,7 @@ public final class SafeExecutor {
 
                 long start = System.nanoTime();
                 List<String> columns = new ArrayList<>();
+                List<String> types = new ArrayList<>();
                 List<List<Object>> rows = new ArrayList<>();
                 int redactions = 0;
                 try (ResultSet rs = st.executeQuery(sql)) {
@@ -74,21 +90,21 @@ public final class SafeExecutor {
                     for (int i = 1; i <= md.getColumnCount(); i++) {
                         columns.add(md.getColumnLabel(i));
                         masked[i - 1] = policy.isMasked(md.getColumnLabel(i));
+                        types.add(masked[i - 1] ? "text" : kind(md.getColumnType(i)));
                     }
                     while (rs.next() && rows.size() <= policy.maxRows()) {
                         List<Object> row = new ArrayList<>(columns.size());
                         for (int i = 1; i <= columns.size(); i++) {
                             Object v = rs.getObject(i);
-                            if (v instanceof BigDecimal bd) v = bd.stripTrailingZeros().toPlainString();
-                            if (v instanceof String s) {
-                                if (masked[i - 1]) {
-                                    v = "***";
-                                    redactions++;
-                                } else {
-                                    int[] count = {0};
-                                    v = scrub(s, count);
-                                    redactions += count[0];
-                                }
+                            if (v != null && masked[i - 1]) {
+                                v = "***";          // whatever its type, a masked column never shows its value
+                                redactions++;
+                            } else if (v instanceof String s) {
+                                int[] count = {0};
+                                v = scrub(s, count);
+                                redactions += count[0];
+                            } else {
+                                v = plain(v);
                             }
                             row.add(v);
                         }
@@ -98,13 +114,40 @@ public final class SafeExecutor {
                 long elapsed = (System.nanoTime() - start) / 1_000_000;
                 boolean truncated = rows.size() > policy.maxRows();
                 if (truncated) rows = rows.subList(0, policy.maxRows());
-                return new QueryResult(columns, rows, truncated, elapsed, redactions);
+                return new QueryResult(columns, types, rows, truncated, elapsed, redactions);
             } finally {
                 c.rollback();
             }
         } catch (SQLException e) {
             throw classify(e);
         }
+    }
+
+    /** Column kind from JDBC metadata, used by the web page to pick a chart. */
+    static String kind(int sqlType) {
+        return switch (sqlType) {
+            case Types.TINYINT, Types.SMALLINT, Types.INTEGER, Types.BIGINT, Types.REAL, Types.FLOAT,
+                 Types.DOUBLE, Types.NUMERIC, Types.DECIMAL -> "number";
+            case Types.DATE -> "date";
+            case Types.TIMESTAMP, Types.TIMESTAMP_WITH_TIMEZONE, Types.TIME, Types.TIME_WITH_TIMEZONE -> "datetime";
+            case Types.BOOLEAN, Types.BIT -> "boolean";
+            default -> "text";
+        };
+    }
+
+    /**
+     * Converts a non-text value to something JSON and the terminal can show: numbers and booleans
+     * stay as they are, dates and times become ISO text, anything else (arrays, intervals, UUIDs, …)
+     * becomes its text form and is scrubbed like any other text.
+     */
+    static Object plain(Object v) {
+        if (v == null || v instanceof Number || v instanceof Boolean) return v;
+        if (v instanceof java.sql.Date d) return d.toLocalDate().toString();
+        if (v instanceof java.sql.Timestamp t) return t.toLocalDateTime().toString();
+        if (v instanceof java.sql.Time t) return t.toLocalTime().toString();
+        if (v instanceof OffsetDateTime o) return o.toString();
+        if (v instanceof java.time.temporal.TemporalAccessor ta) return ta.toString();
+        return scrub(v.toString(), new int[1]);
     }
 
     /** Redact PII-looking substrings; {@code count[0]} is incremented per redaction. */

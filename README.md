@@ -136,7 +136,7 @@ Start Postgres 16 on `localhost:5433`:
 docker compose up -d --wait
 ```
 
-Build the app (also runs the 97 tests):
+Build the app (also runs the 120 tests):
 
 ```bash
 mvn -q package
@@ -171,6 +171,7 @@ java -jar target/querywarden.jar ask "Top 5 customers by total spend on delivere
 |---|---|
 | `ask "question"` | Answer one question |
 | `repl` | Interactive mode: keep asking questions (Ctrl-D to exit) |
+| `serve` | Web page at http://localhost:8080 (`--port N` for another port). See [Web page](#web-page) |
 | `check "SQL"` | Run your own SQL through the checks and the database, without Claude |
 | `schema` | Show exactly what Claude sees about your database |
 | `policy` | Show the policy in effect and which file it came from |
@@ -181,10 +182,45 @@ java -jar target/querywarden.jar ask "Top 5 customers by total spend on delivere
 Stop the demo database with `docker compose down`. It keeps no data volume, so the next
 `docker compose up` starts empty and needs `setup` again.
 
+## Web page
+
+The same agent and guardrails, in a browser: a question box, the answer as a table and (when it
+helps) a chart, the SQL and Claude's explanation, CSV download, recent questions, and a list of
+the tables and columns you can ask about. Works on a phone and in light and dark mode.
+
+Start it (with the demo database running and `QW_DB_URL` / `ANTHROPIC_API_KEY` set as above):
+
+```bash
+java -jar target/querywarden.jar serve
+```
+
+Then open http://localhost:8080. Use `serve --port 9090` for another port. Stop it with Ctrl-C.
+
+The browser only talks to this server; it never reaches the database or Claude directly.
+
+**For now it is for one person on this computer.** The server listens on `127.0.0.1` only and
+refuses to start on any other address. Sharing it with colleagues needs access tokens first (see
+[docs/web-ui-plan.md](docs/web-ui-plan.md)).
+
+Extra protections for the web page, on top of the agent's guardrails:
+
+| Protection | What it does |
+|---|---|
+| This computer only | Listens on `127.0.0.1`; requests whose `Host` isn't `localhost`/`127.0.0.1` are refused (blocks DNS-rebinding tricks) |
+| No other websites | Requests with a foreign `Origin` are refused; the API only accepts JSON |
+| Cost and load limits | At most 10 questions per minute per client and 4 in progress at once; extra requests get a clear "busy" or "too many questions" message |
+| Malicious text can't run | All questions, data and messages are shown as plain text; a strict Content-Security-Policy blocks any script that isn't the page's own |
+| Small requests only | Request bodies over 8 KB are refused |
+| No internal details | Errors show a plain message; the full detail goes to `audit.jsonl` (which also records the client address and timing) |
+| Spreadsheet-safe CSV | Text starting with `=`, `+`, `-` or `@` is prefixed so spreadsheets don't run it as a formula |
+
+Charts are drawn only when they help: a line chart for values over time (a date column and up to
+three number columns), a bar chart for up to 30 categories, and just the table otherwise.
+
 ## Validating it
 
 **1. Automated tests.** No API key needed. These cover the SQL checks, database permissions,
-timeouts, row limits, masking, the retry loop and the `setup` safeguard, against a real Postgres started by Testcontainers:
+timeouts, row limits, masking, the retry loop, the `setup` safeguard and the web server's protections, against a real Postgres started by Testcontainers:
 
 ```bash
 mvn test
@@ -365,18 +401,23 @@ policy.yaml             the rules: allowed tables, blocked/masked columns, limit
 docker-compose.yml      local Postgres 16 for the demo
 src/main/java/dev/querywarden/
   Main.java             command-line interface
+  WebServer.java        web page server: endpoints and web protections
   QueryWardenAgent.java question → SQL → checks → run → result, with retries and audit log
   SqlGenerator.java     interface for the SQL writer (tests plug in a fake one)
   ClaudeSqlGenerator.java  calls Claude (structured JSON output)
   SqlValidator.java     SQL checks before execution
-  SafeExecutor.java     runs SQL as the read-only user; masking
+  SafeExecutor.java     runs SQL as the read-only user; masking; typed values
   Database.java         demo setup and schema description
   Policy.java           loads and checks policy.yaml; built-in defaults
+src/main/resources/web/
+  index.html, app.css, app.js   the page (plain HTML/CSS/JS, no build step)
+  vendor/chart.umd.min.js       Chart.js 4.6.1 (MIT), bundled so nothing loads from outside
 src/test/java/dev/querywarden/
   SqlValidatorTest.java       SQL check tests (no database)
   PostgresGuardrailsTest.java database and agent tests (Testcontainers)
   SetupSafetyTest.java        setup refuses non-demo databases (Testcontainers)
   PolicyTest.java             loading and checking policy files
+  WebServerTest.java          web endpoints and protections (Testcontainers)
 ```
 
 ## Model notes

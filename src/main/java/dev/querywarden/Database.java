@@ -45,6 +45,32 @@ public final class Database {
             return DriverManager.getConnection(url, agentUser, agentPassword);
         }
 
+        /** Agent connections without pooling: a new connection per query (command line). */
+        public javax.sql.DataSource agentDataSource() {
+            org.postgresql.ds.PGSimpleDataSource ds = new org.postgresql.ds.PGSimpleDataSource();
+            ds.setURL(url);
+            ds.setUser(agentUser);
+            ds.setPassword(agentPassword);
+            return ds;
+        }
+
+        /**
+         * A small pool of agent connections (web server). Connections are read-only by default;
+         * the executor still sets read-only, the timeout and rollback on every query.
+         */
+        public com.zaxxer.hikari.HikariDataSource agentPool(int maxConnections) {
+            com.zaxxer.hikari.HikariConfig hc = new com.zaxxer.hikari.HikariConfig();
+            hc.setJdbcUrl(url);
+            hc.setUsername(agentUser);
+            hc.setPassword(agentPassword);
+            hc.setMaximumPoolSize(maxConnections);
+            hc.setMinimumIdle(1);
+            hc.setReadOnly(true);
+            hc.setConnectionTimeout(5_000);
+            hc.setPoolName("querywarden-agent");
+            return new com.zaxxer.hikari.HikariDataSource(hc);
+        }
+
         private static String env(String key, String def) {
             String v = System.getenv(key);
             return v == null || v.isBlank() ? def : v;
@@ -212,30 +238,36 @@ public final class Database {
         }
     }
 
+    /** A table Claude may use, with its visible columns and foreign keys. */
+    public record TableInfo(String name, List<ColumnInfo> columns, List<String> foreignKeys) {}
+
+    public record ColumnInfo(String name, String type, String note) {}
+
     /**
-     * Schema text for the prompt, read through the agent's own connection: information_schema only
-     * lists columns the role has privileges on, and the policy filter is applied on top.
+     * Tables and columns visible to the agent, read through the agent's own connection:
+     * information_schema only lists columns the role has privileges on, and the policy filter is
+     * applied on top.
      */
-    public static String describeSchema(Config cfg, Policy policy) throws SQLException {
+    public static List<TableInfo> schemaInfo(Config cfg, Policy policy) throws SQLException {
         try (Connection c = cfg.agent()) {
             c.setReadOnly(true);
-            StringBuilder out = new StringBuilder();
             String sql = """
                     SELECT c.table_name, c.column_name, c.data_type,
                            col_description(format('%I.%I', c.table_schema, c.table_name)::regclass, c.ordinal_position)
                     FROM information_schema.columns c
                     WHERE c.table_schema = ?
                     ORDER BY c.table_name, c.ordinal_position""";
-            Map<String, List<String>> tables = new LinkedHashMap<>();
+            Map<String, List<ColumnInfo>> columns = new LinkedHashMap<>();
+            Map<String, List<String>> fks = new LinkedHashMap<>();
             try (PreparedStatement ps = c.prepareStatement(sql)) {
                 ps.setString(1, policy.schema());
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         String t = rs.getString(1), col = rs.getString(2);
                         if (!policy.tableAllowed(t) || !policy.columnAllowed(t, col)) continue;
-                        String note = rs.getString(4);
-                        tables.computeIfAbsent(t, k -> new ArrayList<>())
-                                .add("    " + col + " " + rs.getString(3) + (note != null ? "  -- " + note : ""));
+                        columns.computeIfAbsent(t, k -> new ArrayList<>())
+                                .add(new ColumnInfo(col, rs.getString(3), rs.getString(4)));
+                        fks.putIfAbsent(t, new ArrayList<>());
                     }
                 }
             }
@@ -254,17 +286,34 @@ public final class Database {
                 ps.setString(1, policy.schema());
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        if (tables.containsKey(rs.getString(1)) && tables.containsKey(rs.getString(3))) {
-                            tables.get(rs.getString(1)).add("    FK " + rs.getString(2) + " -> "
-                                    + rs.getString(3) + "." + rs.getString(4));
+                        if (columns.containsKey(rs.getString(1)) && columns.containsKey(rs.getString(3))) {
+                            fks.get(rs.getString(1)).add(rs.getString(2) + " -> " + rs.getString(3) + "." + rs.getString(4));
                         }
                     }
                 }
             }
-            tables.forEach((t, cols) -> out.append("TABLE ").append(t).append(" (\n")
-                    .append(String.join("\n", cols)).append("\n)\n"));
-            return out.toString().strip();
+            List<TableInfo> out = new ArrayList<>();
+            columns.forEach((t, cols) -> out.add(new TableInfo(t, List.copyOf(cols), List.copyOf(fks.get(t)))));
+            return out;
         }
+    }
+
+    /** Schema text for the prompt (and the `schema` command). */
+    public static String describeSchema(Config cfg, Policy policy) throws SQLException {
+        return formatSchema(schemaInfo(cfg, policy));
+    }
+
+    static String formatSchema(List<TableInfo> tables) {
+        StringBuilder out = new StringBuilder();
+        for (TableInfo t : tables) {
+            out.append("TABLE ").append(t.name()).append(" (\n");
+            List<String> lines = new ArrayList<>();
+            for (ColumnInfo col : t.columns())
+                lines.add("    " + col.name() + " " + col.type() + (col.note() != null ? "  -- " + col.note() : ""));
+            for (String fk : t.foreignKeys()) lines.add("    FK " + fk);
+            out.append(String.join("\n", lines)).append("\n)\n");
+        }
+        return out.toString().strip();
     }
 
     private static Map<String, List<String>> columns(Connection c, String schema) throws SQLException {

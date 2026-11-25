@@ -63,12 +63,22 @@ public final class QueryWardenAgent {
     private final Path auditLog;
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    /** Command-line use: a new database connection per query. */
     public QueryWardenAgent(Database.Config config, Policy policy, SqlGenerator generator,
                             int maxAttempts, Path auditLog) throws java.sql.SQLException {
+        this(config, config.agentDataSource(), policy, generator, maxAttempts, auditLog);
+    }
+
+    /**
+     * Web server use: queries run on {@code agentConnections} (a pool logging in as the agent user).
+     * One instance can serve many questions at once; each question gets its own conversation.
+     */
+    public QueryWardenAgent(Database.Config config, javax.sql.DataSource agentConnections, Policy policy,
+                            SqlGenerator generator, int maxAttempts, Path auditLog) throws java.sql.SQLException {
         this.policy = policy;
         this.generator = generator;
         this.validator = new SqlValidator(policy);
-        this.executor = new SafeExecutor(config, policy);
+        this.executor = new SafeExecutor(agentConnections, policy);
         this.maxAttempts = maxAttempts;
         this.auditLog = auditLog;
         this.systemPrompt = SYSTEM_TEMPLATE.formatted(policy.schema(),
@@ -88,14 +98,26 @@ public final class QueryWardenAgent {
     }
 
     public Result ask(String question) {
+        return ask(question, "cli");
+    }
+
+    /** {@code client} identifies who asked (e.g. the web client's address); it is only written to the audit log. */
+    public Result ask(String question, String client) {
+        long start = System.nanoTime();
         List<Attempt> attempts = new ArrayList<>();
         Result res;
+        String errorDetail = null;
         try {
             res = run(question, attempts);
+        } catch (SqlGenerator.GeneratorException e) {
+            errorDetail = e.getMessage();
+            res = new Result(question, Status.FAILED, e.userMessage(), "", "", null, attempts, List.of());
         } catch (RuntimeException e) {
-            res = new Result(question, Status.FAILED, "Generator error: " + e.getMessage(), "", "", null, attempts, List.of());
+            errorDetail = e.getClass().getSimpleName() + ": " + e.getMessage();
+            res = new Result(question, Status.FAILED, "Something went wrong. Details are in the audit log.",
+                    "", "", null, attempts, List.of());
         }
-        audit(res);
+        audit(res, client, (System.nanoTime() - start) / 1_000_000, errorDetail);
         return res;
     }
 
@@ -137,16 +159,20 @@ public final class QueryWardenAgent {
                 "Could not produce a safe, valid query after " + maxAttempts + " attempts.", "", "", null, attempts, List.of());
     }
 
-    private void audit(Result r) {
+    /** Synchronized so that questions finishing at the same moment never interleave their lines. */
+    private synchronized void audit(Result r, String client, long elapsedMillis, String errorDetail) {
         if (auditLog == null) return;
         Map<String, Object> e = new LinkedHashMap<>();
         e.put("ts", Instant.now().toString());
+        e.put("client", client);
+        e.put("elapsed_ms", elapsedMillis);
         e.put("question", r.question());
         e.put("status", r.status().name().toLowerCase());
         e.put("message", r.message());
         e.put("sql", r.sql());
         e.put("attempts", r.attempts());
         e.put("rows", r.result() == null ? 0 : r.result().rows().size());
+        if (errorDetail != null) e.put("error", errorDetail);
         try {
             Files.writeString(auditLog, JSON.writeValueAsString(e) + "\n",
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);

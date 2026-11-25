@@ -83,7 +83,12 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
                 // recommended fallback model inside the same call.
                 params.addBeta("server-side-fallback-2026-07-01").fallbacks(BetaFallbacksParam.ofDefault());
             }
-            BetaMessage resp = client.beta().messages().create(params.build());
+            BetaMessage resp;
+            try {
+                resp = client.beta().messages().create(params.build());
+            } catch (RuntimeException e) {
+                throw classify(e);
+            }
             history.add(resp.toParam());
 
             BetaStopReason stop = resp.stopReason().orElse(null);
@@ -91,20 +96,45 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
                 return new Output(false, "", "", "The model declined this request.");
             }
             if (BetaStopReason.MAX_TOKENS.equals(stop)) {
-                throw new IllegalStateException("Model output was truncated (max_tokens).");
+                throw new GeneratorException("The AI's answer was cut off. Try a simpler question.",
+                        "max_tokens reached", null);
             }
             String text = resp.content().stream()
                     .flatMap(b -> b.text().stream())
                     .map(t -> t.text())
                     .findFirst()
-                    .orElseThrow(() -> new IllegalStateException("Model returned no text block."));
+                    .orElseThrow(() -> new GeneratorException("The AI returned an empty answer. Please try again.",
+                            "no text block in response", null));
             try {
                 JsonNode n = JSON.readTree(text);
                 return new Output(n.path("answerable").asBoolean(false), n.path("sql").asText(""),
                         n.path("explanation").asText(""), n.path("reason").asText(""));
             } catch (Exception e) {
-                throw new IllegalStateException("Model returned invalid JSON: " + e.getMessage(), e);
+                throw new GeneratorException("The AI returned an answer that couldn't be read. Please try again.",
+                        "invalid JSON from model: " + e.getMessage(), e);
             }
         };
+    }
+
+    /** Maps SDK errors to a message that is safe and useful to show, keeping the detail for the log. */
+    static GeneratorException classify(RuntimeException e) {
+        String detail = e.getClass().getSimpleName() + ": " + e.getMessage();
+        String user;
+        if (e instanceof com.anthropic.errors.UnauthorizedException
+                || e instanceof com.anthropic.errors.NoCredentialsException
+                || e instanceof com.anthropic.errors.CredentialResolutionException) {
+            user = "The Anthropic API key is missing or was rejected. Check ANTHROPIC_API_KEY.";
+        } else if (e instanceof com.anthropic.errors.PermissionDeniedException) {
+            user = "The Anthropic API key isn't allowed to use this model.";
+        } else if (e instanceof com.anthropic.errors.RateLimitException) {
+            user = "The AI service is busy right now (rate limit). Try again in a minute.";
+        } else if (e instanceof com.anthropic.errors.AnthropicIoException) {
+            user = "Couldn't reach the AI service. Check the internet connection.";
+        } else if (e instanceof com.anthropic.errors.InternalServerException) {
+            user = "The AI service had a temporary problem. Please try again.";
+        } else {
+            user = "Something went wrong while asking the AI. Details are in the audit log.";
+        }
+        return new GeneratorException(user, detail, e);
     }
 }

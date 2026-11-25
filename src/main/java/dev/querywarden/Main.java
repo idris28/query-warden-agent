@@ -16,6 +16,7 @@ import java.util.List;
  *   querywarden check "SELECT ..."         run guardrails + execution on raw SQL (no LLM)
  *   querywarden schema                     print the schema the model sees
  *   querywarden policy                     print the policy in effect
+ *   querywarden serve [--port N]           web page on http://localhost:8080 (this computer only)
  * </pre>
  * Options: --policy FILE (default: $QW_POLICY, then ./policy.yaml, then built-in defaults),
  *          --no-fallbacks (disable server-side refusal fallbacks)
@@ -37,7 +38,7 @@ public final class Main {
         }
         String cmd = args.isEmpty() ? "help" : args.remove(0);
         String rest = String.join(" ", args);
-        if (!List.of("setup", "schema", "check", "ask", "repl", "policy").contains(cmd)) {
+        if (!List.of("setup", "schema", "check", "ask", "repl", "policy", "serve").contains(cmd)) {
             System.out.println(USAGE);
             return;
         }
@@ -73,6 +74,24 @@ public final class Main {
                 print(r);
                 System.exit(r.status() == QueryWardenAgent.Status.OK ? 0 : 1);
             }
+            case "serve" -> {
+                WebServer.Options opts = WebServer.Options.defaults();
+                if (!rest.isBlank()) {
+                    String[] parts = rest.trim().split("\\s+");
+                    if (parts.length != 2 || !parts[0].equals("--port") || !parts[1].matches("\\d{2,5}")) {
+                        System.err.println("usage: querywarden serve [--port N]");
+                        System.exit(2);
+                    }
+                    opts = opts.withPort(Integer.parseInt(parts[1]));
+                }
+                com.zaxxer.hikari.HikariDataSource pool = cfg.agentPool(opts.maxInFlight() + 1);
+                QueryWardenAgent agent = new QueryWardenAgent(cfg, pool, policy, new ClaudeSqlGenerator(fallbacks),
+                        3, Path.of("audit.jsonl"));
+                List<Database.TableInfo> tables = Database.schemaInfo(cfg, policy);
+                new WebServer(agent, policy, pool, () -> tables, opts).start();
+                System.out.println("QueryWarden is running at http://localhost:" + opts.port()
+                        + "  (only reachable from this computer; Ctrl-C to stop)");
+            }
             case "repl" -> {
                 QueryWardenAgent agent = agent(cfg, policy, fallbacks);
                 System.out.println("Ask a question about the database (Ctrl-D to exit).");
@@ -89,7 +108,8 @@ public final class Main {
     }
 
     private static final String USAGE = """
-            usage: querywarden <setup|schema|policy|ask|repl|check> [text] [--policy FILE] [--no-fallbacks]
+            usage: querywarden <setup|schema|policy|ask|repl|check|serve> [text] [--policy FILE] [--no-fallbacks]
+                   querywarden serve [--port N]    web page at http://localhost:8080
             env:   QW_DB_URL, QW_ADMIN_USER, QW_ADMIN_PASSWORD, QW_AGENT_USER, QW_AGENT_PASSWORD,
                    QW_POLICY, ANTHROPIC_API_KEY""";
 
@@ -133,7 +153,8 @@ public final class Main {
         cells.add(r.columns());
         for (List<Object> row : r.rows().subList(0, Math.min(50, r.rows().size()))) {
             cells.add(row.stream().map(v -> {
-                String s = v == null ? "NULL" : v.toString();
+                String s = v == null ? "NULL"
+                        : v instanceof java.math.BigDecimal bd ? bd.stripTrailingZeros().toPlainString() : v.toString();
                 return s.length() > 28 ? s.substring(0, 27) + "…" : s;
             }).toList());
         }

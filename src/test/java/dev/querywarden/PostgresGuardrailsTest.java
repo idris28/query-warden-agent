@@ -193,6 +193,84 @@ class PostgresGuardrailsTest {
         assertTrue(gen.userTurns.isEmpty());
     }
 
+    // ------------------------------------------------------------------ typed values (web page needs these)
+    @Test
+    void valuesAreTypedForJson() throws Exception {
+        var r = new SafeExecutor(cfg, POLICY).execute("""
+                SELECT o.id, o.order_date, o.status, oi.unit_price, o.status = 'delivered' AS done,
+                       date_trunc('month', o.order_date) AS month
+                FROM orders o JOIN order_items oi ON oi.order_id = o.id ORDER BY o.id LIMIT 1""");
+        assertEquals(List.of("number", "date", "text", "number", "boolean", "datetime"), r.columnTypes());
+        List<Object> row = r.rows().get(0);
+        assertTrue(row.get(0) instanceof Number, "id: " + row.get(0).getClass());
+        assertTrue(row.get(1).toString().matches("\\d{4}-\\d{2}-\\d{2}"), "date as ISO text: " + row.get(1));
+        assertTrue(row.get(3) instanceof java.math.BigDecimal, "price stays a number");
+        assertTrue(row.get(4) instanceof Boolean);
+        assertTrue(row.get(5).toString().matches("\\d{4}-\\d{2}-01T00:00"), "timestamp as ISO text: " + row.get(5));
+    }
+
+    @Test
+    void maskedColumnsAreHiddenWhateverTheirType() throws Exception {
+        Policy maskPrice = Policy.parse("masked_columns: [price]", "test");
+        var r = new SafeExecutor(cfg, maskPrice).execute("SELECT name, price FROM products LIMIT 2");
+        r.rows().forEach(row -> assertEquals("***", row.get(1)));
+        assertEquals(List.of("text", "text"), r.columnTypes(), "a masked column is reported as text");
+    }
+
+    @Test
+    void pooledConnectionsKeepEveryGuardrail() throws Exception {
+        try (var pool = cfg.agentPool(2)) {
+            var ex = new SafeExecutor(pool, POLICY);
+            for (int i = 0; i < 5; i++) {   // reuse the same connections several times
+                assertThrows(SafeExecutor.ExecutionException.class, () -> ex.execute("DELETE FROM orders"));
+                assertThrows(SafeExecutor.ExecutionException.class, () -> ex.execute("SELECT salary FROM employees"));
+                assertEquals(600L, ((Number) ex.execute("SELECT count(*) AS n FROM orders").rows().get(0).get(0)).longValue());
+            }
+        }
+    }
+
+    @Test
+    void manyQuestionsAtOnceShareOneAgent(@TempDir Path dir) throws Exception {
+        Path audit = dir.resolve("audit.jsonl");
+        SqlGenerator stateless = system -> text -> ok("SELECT status, COUNT(*) AS n FROM orders GROUP BY status");
+        try (var pool = cfg.agentPool(4)) {
+            var agent = new QueryWardenAgent(cfg, pool, POLICY, stateless, 3, audit);
+            var threads = java.util.concurrent.Executors.newFixedThreadPool(8);
+            List<java.util.concurrent.Future<QueryWardenAgent.Result>> futures = new ArrayList<>();
+            for (int i = 0; i < 24; i++) {
+                int n = i;
+                futures.add(threads.submit(() -> agent.ask("orders per status #" + n, "client-" + n)));
+            }
+            for (var f : futures) assertEquals(QueryWardenAgent.Status.OK, f.get().status());
+            threads.shutdown();
+        }
+        List<String> lines = Files.readAllLines(audit);
+        assertEquals(24, lines.size());
+        var json = new com.fasterxml.jackson.databind.ObjectMapper();
+        for (String line : lines) {
+            var node = json.readTree(line);               // every line is complete, valid JSON
+            assertTrue(node.get("client").asText().startsWith("client-"));
+            assertTrue(node.has("elapsed_ms"));
+        }
+    }
+
+    @Test
+    void aiFailuresShowAPlainMessageAndLogTheDetail(@TempDir Path dir) throws Exception {
+        Path audit = dir.resolve("audit.jsonl");
+        SqlGenerator broken = system -> text -> {
+            throw new SqlGenerator.GeneratorException("The AI service is busy right now (rate limit). Try again in a minute.",
+                    "RateLimitException: 429 secret-internal-detail", null);
+        };
+        var res = agent(broken, audit).ask("orders per status");
+        assertEquals(QueryWardenAgent.Status.FAILED, res.status());
+        assertFalse(res.message().contains("secret-internal-detail"), res.message());
+        assertTrue(Files.readString(audit).contains("secret-internal-detail"), "detail goes to the audit log");
+
+        SqlGenerator crashing = system -> text -> { throw new IllegalStateException("boom-internal"); };
+        var res2 = agent(crashing, null).ask("orders per status");
+        assertFalse(res2.message().contains("boom-internal"), res2.message());
+    }
+
     @Test
     void oversizedQuestionBlocked() throws Exception {
         var gen = new FakeGenerator();

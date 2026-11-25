@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>QueryWarden</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/vendor/chart.umd.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="side" aria-label="Recent questions and available data">
+      <a class="brand" href="/">QueryWarden</a>
+
+      <section class="side-block" aria-labelledby="recent-heading">
+        <h2 id="recent-heading">Recent questions</h2>
+        <ol id="recent" class="recent"></ol>
+        <p id="recent-empty" class="quiet">Questions you ask appear here.</p>
+        <button id="recent-clear" class="link-button" type="button" hidden>Clear recent questions</button>
+      </section>
+
+      <section class="side-block" aria-labelledby="data-heading">
+        <h2 id="data-heading">Data you can ask about</h2>
+        <div id="tables" class="tables"><p class="quiet">Loading…</p></div>
+      </section>
+    </aside>
+
+    <main class="main">
+      <a class="brand brand-top" href="/">QueryWarden</a>
+      <form id="ask-form" class="ask" autocomplete="off">
+        <label for="question" class="ask-label">Ask a question about your data</label>
+        <textarea id="question" name="question" rows="2" required
+                  placeholder="Which customers spent the most last year?"></textarea>
+        <div class="ask-row">
+          <button id="ask-button" type="submit" class="primary">Ask</button>
+          <span class="hint">Enter to ask, Shift+Enter for a new line</span>
+        </div>
+        <div class="examples" id="examples-wrap" hidden>
+          <span class="examples-label" id="examples-label">Try</span>
+          <ul id="examples" class="examples-list" aria-labelledby="examples-label"></ul>
+        </div>
+      </form>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <article id="answer" class="answer" hidden aria-live="polite">
+        <h1 id="answer-question" class="answer-question"></h1>
+        <p id="answer-summary" class="answer-summary"></p>
+        <p id="answer-message" class="answer-message" hidden></p>
+
+        <figure id="chart-wrap" class="chart" hidden>
+          <canvas id="chart" role="img"></canvas>
+          <figcaption id="chart-caption" class="visually-hidden"></figcaption>
+        </figure>
+
+        <div id="table-tools" class="table-tools" hidden>
+          <button id="download" type="button" class="secondary">Download CSV</button>
+        </div>
+        <div id="table-wrap" class="table-wrap" hidden tabindex="0" aria-label="Result table">
+          <table id="table"></table>
+        </div>
+
+        <ul id="warnings" class="warnings" hidden></ul>
+
+        <details id="how" class="how" hidden>
+          <summary>How this was answered</summary>
+          <p id="how-explanation"></p>
+          <pre><code id="how-sql"></code></pre>
+          <div id="how-rejected" hidden>
+            <p>Earlier attempts that QueryWarden rejected and Claude corrected:</p>
+            <ul id="how-rejected-list"></ul>
+          </div>
+        </details>
+      </article>
+    </main>
+  </div>
+</body>
+</html>
