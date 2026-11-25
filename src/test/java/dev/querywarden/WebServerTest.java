@@ -181,7 +181,8 @@ class WebServerTest {
         assertFalse(r.body().contains("salary") || r.body().contains("ssn") || r.body().contains("api_keys"), r.body());
         JsonNode j = JSON.readTree(r.body());
         assertTrue(j.get("tables").size() >= 5);
-        assertTrue(j.get("examples").size() > 0);
+        assertEquals(0, j.get("examples").size(), "no examples in the policy and no AI helper: none shown");
+        assertEquals("none", j.get("examples_source").asText());
         assertTrue(r.body().contains("\"masked\":true"), "email/phone are flagged as masked");
     }
 
@@ -298,6 +299,153 @@ class WebServerTest {
         assertFalse(WebServer.isLocalOrigin("http://localhost:9999", 8080));
         assertFalse(WebServer.isLocalOrigin("https://evil.example", 8080));
         assertFalse(WebServer.isLocalOrigin("null", 8080));
+    }
+
+    // ------------------------------------------------------------------ streaming, insights and examples
+    /** Records what it was given; answers with fixed text. */
+    static final class FakeAi implements AiHelper {
+        volatile List<List<Object>> rowsSeen = List.of(List.of("not called"));
+        volatile String questionSeen;
+
+        @Override
+        public List<String> suggestExamples(String schemaText, int count) {
+            return schemaText.contains("TABLE orders") ? List.of("How many orders per status?", "Revenue by month")
+                    : List.of();
+        }
+
+        @Override
+        public Insight describe(String schemaText, String question, String sql, List<String> columns,
+                                List<List<Object>> rows) {
+            rowsSeen = rows;
+            questionSeen = question;
+            return new Insight(rows == null ? "" : "Delivered orders are the largest group.",
+                    List.of("Orders per status in 2025", "<b>Which customers</b> cancel most?"));
+        }
+    }
+
+    int startWithAi(SqlGenerator gen, Policy policy, FakeAi ai) throws Exception {
+        var agent = new QueryWardenAgent(cfg, pool, policy, gen, 3, null);
+        var examples = WebServer.resolveExamples(policy, ai, Database.formatSchema(tables));
+        app = new WebServer(agent, policy, pool, () -> tables, ai, examples,
+                new WebServer.Options("127.0.0.1", 0, 4, 100)).start();
+        return app.port();
+    }
+
+    List<JsonNode> streamEvents(int port, String question) throws Exception {
+        var r = http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/ask/stream"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(java.util.Map.of("question", question))))
+                .build(), HttpResponse.BodyHandlers.ofLines());
+        assertEquals(200, r.statusCode());
+        assertTrue(r.headers().firstValue("Content-Type").orElse("").startsWith("application/x-ndjson"));
+        List<JsonNode> events = new java.util.ArrayList<>();
+        for (String line : r.body().toList()) if (!line.isBlank()) events.add(JSON.readTree(line));
+        return events;
+    }
+
+    static List<String> types(List<JsonNode> events) {
+        return events.stream().map(e -> e.get("type").asText() + (e.has("stage") ? ":" + e.get("stage").asText() : "")).toList();
+    }
+
+    @Test
+    void streamSendsProgressThenResultThenInsights() throws Exception {
+        Policy sharing = Policy.parse("share_results_with_ai: true", "test");
+        FakeAi ai = new FakeAi();
+        int port = startWithAi(byKeyword(), sharing, ai);
+        List<JsonNode> events = streamEvents(port, "orders per status");
+        assertEquals(List.of("progress:writing", "progress:checking", "progress:running", "result",
+                "progress:summarizing", "insights", "done"), types(events));
+        JsonNode result = events.get(3);
+        assertEquals("ok", result.get("status").asText());
+        assertEquals(4, result.get("rows").size());
+        JsonNode insights = events.get(5);
+        assertEquals("Delivered orders are the largest group.", insights.get("summary").asText());
+        assertEquals(2, insights.get("follow_ups").size());
+        assertEquals(4, ai.rowsSeen.size(), "with sharing on, Claude sees the (masked) rows");
+    }
+
+    @Test
+    void withoutSharingClaudeNeverSeesRows() throws Exception {
+        FakeAi ai = new FakeAi();
+        int port = startWithAi(byKeyword(), POLICY, ai);      // built-in default: sharing off
+        List<JsonNode> events = streamEvents(port, "orders per status");
+        JsonNode insights = events.stream().filter(e -> e.get("type").asText().equals("insights")).findFirst().orElseThrow();
+        assertEquals(null, ai.rowsSeen, "rows must not be passed to the AI helper");
+        assertEquals("", insights.get("summary").asText());
+        assertEquals(2, insights.get("follow_ups").size(), "follow-ups still come, from question/SQL/columns");
+        assertTrue(events.stream().anyMatch(e -> e.path("text").asText().contains("suggesting follow-up")));
+    }
+
+    @Test
+    void streamShowsRejectedAttempts() throws Exception {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        SqlGenerator repairs = system -> text -> calls.getAndIncrement() % 2 == 0
+                ? ok("SELECT name, salary FROM employees")
+                : ok("SELECT department, COUNT(*) AS n FROM employees GROUP BY 1");
+        int port = startWithAi(repairs, POLICY, new FakeAi());
+        List<JsonNode> events = streamEvents(port, "employees");
+        assertEquals(List.of("progress:writing", "progress:checking", "progress:rejected", "progress:writing",
+                "progress:checking", "progress:running", "result", "progress:summarizing", "insights", "done"), types(events));
+        assertTrue(events.get(2).get("text").asText().contains("COLUMN_NOT_ALLOWED"));
+        assertTrue(events.get(3).get("text").asText().contains("correcting"));
+    }
+
+    @Test
+    void declinedQuestionsGetNoInsights() throws Exception {
+        FakeAi ai = new FakeAi();
+        int port = startWithAi(byKeyword(), POLICY, ai);
+        List<JsonNode> events = streamEvents(port, "average salary");
+        assertEquals(List.of("progress:writing", "result", "done"), types(events));
+        assertEquals("unanswerable", events.get(1).get("status").asText());
+        assertEquals(null, ai.questionSeen, "the AI helper isn't called for declined questions");
+    }
+
+    @Test
+    void streamKeepsTheSameProtections() throws Exception {
+        int port = startWithAi(byKeyword(), POLICY, new FakeAi());
+        var plain = http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/ask/stream"))
+                .header("Content-Type", "text/plain").POST(HttpRequest.BodyPublishers.ofString("hi")).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(415, plain.statusCode());
+        var foreign = http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/ask/stream"))
+                .header("Content-Type", "application/json").header("Origin", "https://evil.example")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"question\":\"orders per status\"}")).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(403, foreign.statusCode());
+    }
+
+    @Test
+    void examplesComeFromThePolicyFirst() throws Exception {
+        Policy withExamples = Policy.parse("examples: [\"Custom question one\"]", "test");
+        int port = startWithAi(byKeyword(), withExamples, new FakeAi());
+        JsonNode j = JSON.readTree(get(port, "/api/schema").body());
+        assertEquals("policy", j.get("examples_source").asText());
+        assertEquals("Custom question one", j.get("examples").get(0).asText());
+    }
+
+    @Test
+    void examplesFallBackToClaudeThenToNone() throws Exception {
+        FakeAi ai = new FakeAi();
+        var fromAi = WebServer.resolveExamples(POLICY, ai, Database.formatSchema(tables));
+        assertEquals("ai", fromAi.source());
+        assertEquals(2, fromAi.questions().size());
+        var none = WebServer.resolveExamples(POLICY, AiHelper.NONE, "TABLE x ()");
+        assertEquals("none", none.source());
+        assertTrue(none.questions().isEmpty());
+    }
+
+    @Test
+    void aiHelperOutputIsTrimmedAndCapped() throws Exception {
+        var arr = JSON.readTree("[\"  Revenue by month \", \"\", \"Revenue by month\", \"" + "x".repeat(300)
+                + "\", \"Top products\", \"Orders per status\", \"One too many\"]");
+        assertEquals(List.of("Revenue by month", "Top products", "Orders per status"),
+                ClaudeAiHelper.cleanQuestions(arr, 3), "blank, duplicate and over-long questions are dropped");
+        List<List<Object>> rows = new java.util.ArrayList<>();
+        for (int i = 0; i < 80; i++) rows.add(List.of("row" + i, "y".repeat(500)));
+        String json = ClaudeAiHelper.resultJson(List.of("a", "b"), rows);
+        assertTrue(json.contains("row49") && !json.contains("row50"), "at most 50 rows are shared");
+        assertTrue(json.contains("(first 50 of 80 rows)"));
+        assertFalse(json.contains("y".repeat(101)), "long cells are cut to 100 characters");
     }
 
     @Test

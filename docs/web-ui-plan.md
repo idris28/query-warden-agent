@@ -1,6 +1,8 @@
 # Plan: QueryWarden web page
 
-Status: first version built and tested (2026-11-25). Next: access tokens for network use, follow-up questions.
+Status: built and tested (2026-11-25). Second round added: examples from `policy.yaml` or Claude, live
+progress, result summaries and suggested follow-ups, sorting, filtering and chart controls.
+Next: access tokens for network use, follow-up questions with memory, keeping earlier answers on the page.
 
 **Decision (2026-11-25):** first version is for one person on this Mac only. The server listens
 on this computer only and refuses any other address. Access tokens and network use come later,

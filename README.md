@@ -136,7 +136,7 @@ Start Postgres 16 on `localhost:5433`:
 docker compose up -d --wait
 ```
 
-Build the app (also runs the 120 tests):
+Build the app (also runs the 132 tests):
 
 ```bash
 mvn -q package
@@ -184,9 +184,21 @@ Stop the demo database with `docker compose down`. It keeps no data volume, so t
 
 ## Web page
 
-The same agent and guardrails, in a browser: a question box, the answer as a table and (when it
-helps) a chart, the SQL and Claude's explanation, CSV download, recent questions, and a list of
-the tables and columns you can ask about. Works on a phone and in light and dark mode.
+The same agent and guardrails, in a browser. Works on a phone and in light and dark mode.
+
+- **Example questions** to click, taken from `examples` in `policy.yaml`. If the policy has none,
+  Claude suggests six that fit your tables when the server starts, so they always match the
+  database. The startup output says which source was used.
+- **Live progress** while you wait: Claude writing the SQL, the safety check, the query running.
+  If a query is rejected, you see why and that Claude is correcting it.
+- **The answer** as a table and, when it helps, a chart. Switch between bar chart, line chart and
+  table only, and pick which number column to plot.
+- **A one-line summary** of the result (only when `share_results_with_ai: true`; see below).
+- **"Ask next"**: three suggested follow-up questions. Clicking one asks it, through every guardrail.
+- **Sort** by clicking a column heading, **filter** rows by typing (results with more than 5 rows),
+  and **download** the rows as shown as CSV.
+- **"How this was answered"**: Claude's explanation, the SQL, and any rejected attempts.
+- Recent questions (kept only in this browser) and the list of tables and columns you can ask about.
 
 Start it (with the demo database running and `QW_DB_URL` / `ANTHROPIC_API_KEY` set as above):
 
@@ -214,8 +226,14 @@ Extra protections for the web page, on top of the agent's guardrails:
 | No internal details | Errors show a plain message; the full detail goes to `audit.jsonl` (which also records the client address and timing) |
 | Spreadsheet-safe CSV | Text starting with `=`, `+`, `-` or `@` is prefixed so spreadsheets don't run it as a formula |
 
-Charts are drawn only when they help: a line chart for values over time (a date column and up to
-three number columns), a bar chart for up to 30 categories, and just the table otherwise.
+Charts start in the most useful view: a line chart for values over time, a bar chart for up to 30
+categories, and the table otherwise. ID columns are never plotted. When number columns differ a lot
+in size (revenue next to a count), only one is plotted at first, preferring the column the rows are
+ordered by.
+
+**Extra Claude calls on the web page.** Each answered question makes one more small Claude call (low
+effort, typically 2–3 seconds) for the summary and follow-ups, and the server makes one call at
+startup if `policy.yaml` has no examples. Declined and blocked questions make no extra call.
 
 ## Validating it
 
@@ -275,6 +293,9 @@ can't affect your live application.
 - `allowed_tables`: tables Claude may use
 - `blocked_columns`: columns that must never be read (salaries, tokens, …)
 - `masked_columns`: columns that may be read but are hidden in output (email, phone, …)
+- `examples`: questions that fit your data, or leave it out and let Claude suggest them
+- `share_results_with_ai`: leave it `false` unless sending result rows to the Anthropic API is
+  acceptable for this data
 
 Then check it with `java -jar target/querywarden.jar policy`. Keep a separate file per database
 if you like, and choose one with `--policy FILE` or `QW_POLICY`.
@@ -330,9 +351,15 @@ java -jar target/querywarden.jar ask "your first question"
 
 | Sent to Claude (Anthropic API) | Never sent |
 |---|---|
-| Your question | Query results: rows stay on your machine |
-| Table and column names, and column comments | Blocked tables and columns |
+| Your question | Blocked tables and columns |
+| Table and column names, and column comments | Query results, unless you turn on `share_results_with_ai` |
 | Error messages when a query fails (personal data scrubbed) | |
+| Web page: the SQL and column names of each answer, to suggest follow-ups | |
+| Web page, only with `share_results_with_ai: true`: up to 50 result rows, after masking, for the summary | |
+
+`share_results_with_ai` is **off** unless the policy turns it on. The demo's `policy.yaml` turns it
+on because the demo data is fake. For a real database, decide deliberately: masked columns stay
+masked, but every other value in the first 50 rows of each answer would be sent.
 
 Table and column names alone can be sensitive (for example a table called `layoff_candidates`).
 For company data, confirm that sending schema details to the Anthropic API fits your data policy.
@@ -355,6 +382,10 @@ blocked_columns:
   employees: [salary, ssn]
 masked_columns: [email, phone]
 blocked_functions: []        # extras; the built-in dangerous-function list always applies
+examples:                    # optional; questions shown on the web page (at most 12)
+  - How many orders are there per status?
+  - Revenue by product category
+share_results_with_ai: false # true lets Claude see up to 50 masked result rows to write summaries
 limits:
   max_rows: 200
   timeout_ms: 3000
@@ -367,6 +398,7 @@ limits:
 - Keys you leave out keep their default values.
 - **Unknown keys are an error** (exit code 4), so a typo such as `blocked_column` can't silently
   switch a protection off. Out-of-range limits and invalid names are rejected the same way.
+- Without `examples`, the web page asks Claude to suggest some from the tables it can see.
 - `blocked_functions` only **adds** to the built-in list of dangerous PostgreSQL functions
   (`pg_sleep`, `pg_read_file`, `set_config`, `dblink`, …). It can't remove any.
 - The policy controls QueryWarden's checks, masking and what Claude is shown. On a real database,
@@ -405,6 +437,8 @@ src/main/java/dev/querywarden/
   QueryWardenAgent.java question → SQL → checks → run → result, with retries and audit log
   SqlGenerator.java     interface for the SQL writer (tests plug in a fake one)
   ClaudeSqlGenerator.java  calls Claude (structured JSON output)
+  AiHelper.java         interface for example questions, summaries and follow-ups
+  ClaudeAiHelper.java   Claude-backed AiHelper (low effort; never breaks an answer)
   SqlValidator.java     SQL checks before execution
   SafeExecutor.java     runs SQL as the read-only user; masking; typed values
   Database.java         demo setup and schema description

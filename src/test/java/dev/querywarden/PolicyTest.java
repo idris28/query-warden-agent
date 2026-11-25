@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Set;
 
 import org.junit.jupiter.api.Test;
@@ -19,8 +20,30 @@ class PolicyTest {
 
     @Test
     void shippedPolicyFileMatchesBuiltInDefaults() throws Exception {
-        assertEquals(Policy.defaults(), Policy.load(Path.of("policy.yaml")),
-                "policy.yaml in the project root should describe the demo database exactly");
+        Policy shipped = Policy.load(Path.of("policy.yaml"));
+        Policy d = Policy.defaults();
+        // The guardrails must match exactly; only the demo's examples and result sharing differ.
+        assertEquals(new Policy(d.schema(), d.allowedTables(), d.blockedColumns(), d.maskedColumns(), d.maxRows(),
+                        d.timeoutMillis(), d.maxJoins(), d.maxSelects(), d.maxQuestionChars(), d.maxSqlChars(),
+                        d.blockedFunctions(), shipped.examples(), shipped.shareResultsWithAi()),
+                shipped, "policy.yaml in the project root should describe the demo database exactly");
+        assertEquals(6, shipped.examples().size());
+        assertTrue(shipped.shareResultsWithAi(), "demo data is fake, so the demo shares results");
+        assertTrue(d.examples().isEmpty());
+        assertFalse(d.shareResultsWithAi(), "without a policy file, results never leave the machine");
+    }
+
+    @Test
+    void examplesAndResultSharing() throws Exception {
+        Policy p = Policy.parse("""
+                examples:
+                  - "Orders: how many per status?"
+                  - Revenue by month
+                share_results_with_ai: true
+                """, "test");
+        assertEquals(List.of("Orders: how many per status?", "Revenue by month"), p.examples());
+        assertTrue(p.shareResultsWithAi());
+        assertEquals(p, Policy.parse(p.toYaml(), "roundtrip"), "questions with colons survive toYaml");
     }
 
     @Test
@@ -76,6 +99,9 @@ class PolicyTest {
             "limits:\\n  timeout_ms: 999999999                   | limits.timeout_ms must be between",
             "limits:\\n  max_rows: lots                          | limits.max_rows must be a whole number",
             "allowed_tables: [a\\n  b: c                           | not valid YAML",
+            "examples: Revenue by month                              | examples must be a list of questions",
+            "examples: [42]                                          | examples must be a list of questions",
+            "share_results_with_ai: yes please                       | share_results_with_ai must be true or false",
     })
     void rejectsMistakesWithAClearMessage(String yaml, String expected) {
         var e = assertThrows(Policy.PolicyException.class, () -> Policy.parse(yaml.replace("\\n", "\n"), "test.yaml"));

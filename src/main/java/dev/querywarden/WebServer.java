@@ -54,13 +54,18 @@ public final class WebServer {
 
     static final Set<String> LOCAL_HOSTNAMES = Set.of("localhost", "127.0.0.1", "[::1]", "::1");
 
-    static final List<String> EXAMPLES = List.of(
-            "How many orders are there per status?",
-            "Top 5 customers by total spend on delivered orders",
-            "Monthly revenue in 2025",
-            "Revenue by product category",
-            "Which country has the most customers?",
-            "Average order value by month in 2025");
+    /** Example questions for the page, and where they came from ("policy", "ai" or "none"). */
+    public record Examples(List<String> questions, String source) {}
+
+    /**
+     * Examples from policy.yaml if it lists any; otherwise Claude suggests some that fit the tables
+     * the agent can see. If that fails, the page simply shows none.
+     */
+    public static Examples resolveExamples(Policy policy, AiHelper ai, String schemaText) {
+        if (!policy.examples().isEmpty()) return new Examples(policy.examples(), "policy");
+        List<String> suggested = ai.suggestExamples(schemaText, 6);
+        return suggested.isEmpty() ? new Examples(List.of(), "none") : new Examples(suggested, "ai");
+    }
 
     static final String CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
             + "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; "
@@ -72,17 +77,28 @@ public final class WebServer {
     private final Policy policy;
     private final DataSource agentConnections;
     private final Supplier<List<Database.TableInfo>> schema;
+    private final AiHelper ai;
+    private final Examples examples;
     private final Options options;
     private final Semaphore inFlight;
     private final Map<String, Deque<Long>> recentByClient = new HashMap<>();
     private volatile int boundPort;
 
+    /** Without AI help: examples only from the policy, no summaries or follow-ups. */
     public WebServer(QueryWardenAgent agent, Policy policy, DataSource agentConnections,
                      Supplier<List<Database.TableInfo>> schema, Options options) {
+        this(agent, policy, agentConnections, schema, AiHelper.NONE,
+                new Examples(policy.examples(), policy.examples().isEmpty() ? "none" : "policy"), options);
+    }
+
+    public WebServer(QueryWardenAgent agent, Policy policy, DataSource agentConnections,
+                     Supplier<List<Database.TableInfo>> schema, AiHelper ai, Examples examples, Options options) {
         this.agent = agent;
         this.policy = policy;
         this.agentConnections = agentConnections;
         this.schema = schema;
+        this.ai = ai;
+        this.examples = examples;
         this.options = options;
         this.inFlight = new Semaphore(options.maxInFlight());
     }
@@ -101,6 +117,7 @@ public final class WebServer {
             config.routes.get("/api/health", this::health);
             config.routes.get("/api/schema", this::schema);
             config.routes.post("/api/ask", this::ask);
+            config.routes.post("/api/ask/stream", this::askStream);
             config.routes.exception(Exception.class, (e, ctx) -> {
                 System.err.println("web: unexpected error on " + ctx.path() + ": " + e);
                 json(ctx, 500, Map.of("status", "failed", "message", "Something went wrong on the server."));
@@ -196,17 +213,20 @@ public final class WebServer {
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("tables", tables);
-        out.put("examples", EXAMPLES);
+        out.put("examples", examples.questions());
+        out.put("examples_source", examples.source());
+        out.put("shares_results_with_ai", policy.shareResultsWithAi());
         out.put("max_question_chars", policy.maxQuestionChars());
         out.put("max_rows", policy.maxRows());
         json(ctx, 200, out);
     }
 
-    private void ask(Context ctx) {
+    /** Reads {"question": "..."} and applies the rate and busy limits. Returns null after replying with an error. */
+    private String admit(Context ctx) {
         String type = ctx.contentType() == null ? "" : ctx.contentType().toLowerCase(Locale.ROOT);
         if (!type.startsWith("application/json")) {
             json(ctx, 415, failed("Send the question as JSON."));
-            return;
+            return null;
         }
         String question;
         try {
@@ -216,19 +236,24 @@ public final class WebServer {
             question = q.asText();
         } catch (Exception e) {
             json(ctx, 400, failed("Expected {\"question\": \"...\"}."));
-            return;
+            return null;
         }
-
-        String client = ctx.ip();
-        if (!allow(client)) {
+        if (!allow(ctx.ip())) {
             json(ctx, 429, failed("Too many questions. You can ask up to " + options.perClientPerMinute()
                     + " per minute; please wait a moment."));
-            return;
+            return null;
         }
         if (!inFlight.tryAcquire()) {
             json(ctx, 503, failed("QueryWarden is busy with other questions. Please try again in a few seconds."));
-            return;
+            return null;
         }
+        return question;   // caller must release inFlight
+    }
+
+    private void ask(Context ctx) {
+        String question = admit(ctx);
+        if (question == null) return;
+        String client = ctx.ip();
         long start = System.nanoTime();
         QueryWardenAgent.Result r;
         try {
@@ -237,6 +262,60 @@ public final class WebServer {
             inFlight.release();
         }
         json(ctx, 200, toJson(r, (System.nanoTime() - start) / 1_000_000));
+    }
+
+    /**
+     * Streams newline-delimited JSON events while the question is answered, so the page can show
+     * live progress:
+     * <pre>
+     *   {"type":"progress","stage":"writing|checking|running|rejected|summarizing","text":"..."}
+     *   {"type":"result", ...same fields as /api/ask...}
+     *   {"type":"insights","summary":"...","follow_ups":["..."]}     (answered questions only)
+     *   {"type":"done"}
+     * </pre>
+     */
+    private void askStream(Context ctx) throws Exception {
+        String question = admit(ctx);
+        if (question == null) return;
+        String client = ctx.ip();
+        try {
+            var res = ctx.res();
+            res.setStatus(200);
+            res.setContentType("application/x-ndjson; charset=utf-8");
+            res.setHeader("Cache-Control", "no-store");
+            res.setHeader("X-Accel-Buffering", "no");
+            var out = res.getOutputStream();
+            java.util.function.Consumer<Map<String, Object>> send = event -> {
+                synchronized (out) {
+                    try {
+                        out.write((JSON.writeValueAsString(event) + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        out.flush();
+                    } catch (java.io.IOException e) {
+                        throw new java.io.UncheckedIOException(e);   // browser went away
+                    }
+                }
+            };
+            long start = System.nanoTime();
+            QueryWardenAgent.Result r = agent.ask(question, "web " + client,
+                    p -> send.accept(Map.of("type", "progress", "stage", p.stage(), "text", p.text())));
+            Map<String, Object> result = new LinkedHashMap<>(toJson(r, (System.nanoTime() - start) / 1_000_000));
+            result.put("type", "result");
+            send.accept(result);
+
+            if (r.status() == QueryWardenAgent.Status.OK && ai != AiHelper.NONE) {
+                boolean share = policy.shareResultsWithAi();
+                send.accept(Map.of("type", "progress", "stage", "summarizing",
+                        "text", share ? "Claude is summarising the result" : "Claude is suggesting follow-up questions"));
+                AiHelper.Insight insight = ai.describe(Database.formatSchema(schema.get()), question, r.sql(),
+                        r.result().columns(), share ? r.result().rows() : null);
+                send.accept(Map.of("type", "insights", "summary", insight.summary(), "follow_ups", insight.followUps()));
+            }
+            send.accept(Map.of("type", "done"));
+        } catch (java.io.UncheckedIOException e) {
+            // the browser closed the connection; nothing more to send
+        } finally {
+            inFlight.release();
+        }
     }
 
     /** Sliding one-minute window per client. */

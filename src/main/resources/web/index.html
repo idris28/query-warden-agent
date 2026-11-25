@@ -44,11 +44,24 @@
       </form>
 
       <p id="status" class="status" role="status" aria-live="polite"></p>
+      <ol id="progress" class="progress" hidden aria-label="Progress"></ol>
 
       <article id="answer" class="answer" hidden aria-live="polite">
         <h1 id="answer-question" class="answer-question"></h1>
         <p id="answer-summary" class="answer-summary"></p>
+        <p id="answer-insight" class="answer-insight" hidden></p>
         <p id="answer-message" class="answer-message" hidden></p>
+
+        <div id="chart-controls" class="chart-controls" hidden>
+          <div class="segmented" role="group" aria-label="Show as">
+            <button type="button" data-view="bar" aria-pressed="false">Bar chart</button>
+            <button type="button" data-view="line" aria-pressed="false">Line chart</button>
+            <button type="button" data-view="table" aria-pressed="false">Table only</button>
+          </div>
+          <label class="plot-pick" id="plot-pick" hidden>Plot
+            <select id="plot-column"></select>
+          </label>
+        </div>
 
         <figure id="chart-wrap" class="chart" hidden>
           <canvas id="chart" role="img"></canvas>
@@ -56,6 +69,11 @@
         </figure>
 
         <div id="table-tools" class="table-tools" hidden>
+          <label class="filter" id="filter-wrap" hidden>
+            <span class="visually-hidden">Filter rows</span>
+            <input id="filter" type="search" placeholder="Filter rows" autocomplete="off">
+          </label>
+          <span id="row-count" class="row-count" aria-live="polite"></span>
           <button id="download" type="button" class="secondary">Download CSV</button>
         </div>
         <div id="table-wrap" class="table-wrap" hidden tabindex="0" aria-label="Result table">
@@ -63,6 +81,11 @@
         </div>
 
         <ul id="warnings" class="warnings" hidden></ul>
+
+        <section id="next" class="next" hidden aria-labelledby="next-heading">
+          <h2 id="next-heading">Ask next</h2>
+          <ul id="next-list"></ul>
+        </section>
 
         <details id="how" class="how" hidden>
           <summary>How this was answered</summary>

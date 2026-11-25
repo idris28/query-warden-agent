@@ -51,6 +51,9 @@ public final class QueryWardenAgent {
 
     public record Attempt(String sql, String status, String detail, String executedSql) {}
 
+    /** A step the agent has reached, for live progress on the web page. */
+    public record Progress(String stage, String text) {}
+
     public record Result(String question, Status status, String message, String sql, String explanation,
                          SafeExecutor.QueryResult result, List<Attempt> attempts, List<String> warnings) {}
 
@@ -103,12 +106,24 @@ public final class QueryWardenAgent {
 
     /** {@code client} identifies who asked (e.g. the web client's address); it is only written to the audit log. */
     public Result ask(String question, String client) {
+        return ask(question, client, p -> { });
+    }
+
+    /**
+     * Like {@link #ask(String, String)}, reporting each stage to {@code progress} as it happens:
+     * {@code writing}, {@code checking}, {@code running}, and {@code rejected} when a query is refused
+     * and Claude is asked to correct it. A failing listener never affects the answer.
+     */
+    public Result ask(String question, String client, java.util.function.Consumer<Progress> progress) {
         long start = System.nanoTime();
         List<Attempt> attempts = new ArrayList<>();
         Result res;
         String errorDetail = null;
+        java.util.function.Consumer<Progress> safe = p -> {
+            try { progress.accept(p); } catch (RuntimeException ignored) { }
+        };
         try {
-            res = run(question, attempts);
+            res = run(question, attempts, safe);
         } catch (SqlGenerator.GeneratorException e) {
             errorDetail = e.getMessage();
             res = new Result(question, Status.FAILED, e.userMessage(), "", "", null, attempts, List.of());
@@ -121,13 +136,14 @@ public final class QueryWardenAgent {
         return res;
     }
 
-    private Result run(String question, List<Attempt> attempts) {
+    private Result run(String question, List<Attempt> attempts, java.util.function.Consumer<Progress> progress) {
         String blocked = checkInput(question);
         if (blocked != null) return new Result(question, Status.BLOCKED, blocked, "", "", null, attempts, List.of());
 
         SqlGenerator.Conversation convo = generator.open(systemPrompt);
         String next = "<question>" + question + "</question>";
         for (int i = 0; i < maxAttempts; i++) {
+            progress.accept(new Progress("writing", i == 0 ? "Claude is writing the SQL" : "Claude is correcting the query"));
             SqlGenerator.Output out = convo.send(next);
             String sql = out.sql() == null ? "" : out.sql().strip();
             if (!out.answerable() || sql.isEmpty()) {
@@ -139,11 +155,14 @@ public final class QueryWardenAgent {
             SqlValidator.ValidatedQuery vq;
             SafeExecutor.QueryResult qr;
             try {
+                progress.accept(new Progress("checking", "Checking the SQL against the safety rules"));
                 vq = validator.validate(sql);
+                progress.accept(new Progress("running", "Running the query (read-only)"));
                 qr = executor.execute(vq.sql());
             } catch (SqlValidator.ValidationException | SafeExecutor.ExecutionException e) {
                 String kind = e instanceof SqlValidator.ValidationException ? "validation_error" : "execution_error";
                 attempts.add(new Attempt(sql, kind, e.getMessage(), ""));
+                progress.accept(new Progress("rejected", e.getMessage()));
                 next = "That query was rejected: " + e.getMessage() + "\n"
                         + "Return a corrected query that follows the rules, or set answerable=false "
                         + "if the question needs restricted data or operations.";

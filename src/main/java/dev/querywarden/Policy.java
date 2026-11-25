@@ -34,7 +34,9 @@ public record Policy(
         int maxSelects,
         int maxQuestionChars,
         int maxSqlChars,
-        Set<String> blockedFunctions) {
+        Set<String> blockedFunctions,
+        List<String> examples,
+        boolean shareResultsWithAi) {
 
     /** Dangerous PostgreSQL functions. Always blocked; a policy file can only add to this list. */
     public static final Set<String> BUILT_IN_BLOCKED_FUNCTIONS = Set.of(
@@ -63,8 +65,13 @@ public record Policy(
                 6,
                 1000,
                 4000,
-                BUILT_IN_BLOCKED_FUNCTIONS);
+                BUILT_IN_BLOCKED_FUNCTIONS,
+                List.of(),     // no examples: the web page asks Claude to suggest some
+                false);        // result rows never leave this machine unless the policy says so
     }
+
+    public static final int MAX_EXAMPLES = 12;
+    public static final int MAX_EXAMPLE_CHARS = 200;
 
     // ------------------------------------------------------------------ loading from YAML
 
@@ -81,7 +88,8 @@ public record Policy(
     public static final String DEFAULT_FILE = "policy.yaml";
 
     private static final Set<String> TOP_KEYS = Set.of(
-            "schema", "allowed_tables", "blocked_columns", "masked_columns", "blocked_functions", "limits");
+            "schema", "allowed_tables", "blocked_columns", "masked_columns", "blocked_functions", "limits",
+            "examples", "share_results_with_ai");
     private static final Set<String> LIMIT_KEYS = Set.of(
             "max_rows", "timeout_ms", "max_joins", "max_selects", "max_question_chars", "max_sql_chars");
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*");
@@ -151,6 +159,31 @@ public record Policy(
         if (root.has("blocked_functions"))
             functions.addAll(identifiers(root.get("blocked_functions"), origin, "blocked_functions", true));
 
+        List<String> examples = d.examples();
+        if (root.has("examples") && !root.get("examples").isNull()) {
+            JsonNode ex = root.get("examples");
+            if (!ex.isArray()) throw new PolicyException(origin + ": examples must be a list of questions.");
+            List<String> list = new ArrayList<>();
+            for (JsonNode item : ex) {
+                if (!item.isTextual() || item.asText().isBlank())
+                    throw new PolicyException(origin + ": examples must be a list of questions (text).");
+                String q = item.asText().strip();
+                if (q.length() > MAX_EXAMPLE_CHARS)
+                    throw new PolicyException(origin + ": examples: '" + q.substring(0, 40) + "…' is longer than "
+                            + MAX_EXAMPLE_CHARS + " characters.");
+                list.add(q);
+            }
+            if (list.size() > MAX_EXAMPLES)
+                throw new PolicyException(origin + ": examples: at most " + MAX_EXAMPLES + " questions (got " + list.size() + ").");
+            examples = List.copyOf(list);
+        }
+        boolean share = d.shareResultsWithAi();
+        if (root.has("share_results_with_ai") && !root.get("share_results_with_ai").isNull()) {
+            JsonNode sh = root.get("share_results_with_ai");
+            if (!sh.isBoolean()) throw new PolicyException(origin + ": share_results_with_ai must be true or false.");
+            share = sh.asBoolean();
+        }
+
         JsonNode limits = root.path("limits");
         if (!limits.isMissingNode() && !limits.isNull()) {
             if (!limits.isObject()) throw new PolicyException(origin + ": limits must be a set of key: value pairs.");
@@ -164,7 +197,9 @@ public record Policy(
                 limit(limits, "max_selects", d.maxSelects(), 1, 50, origin),
                 limit(limits, "max_question_chars", d.maxQuestionChars(), 1, 100_000, origin),
                 limit(limits, "max_sql_chars", d.maxSqlChars(), 100, 100_000, origin),
-                Set.copyOf(functions));
+                Set.copyOf(functions),
+                examples,
+                share);
     }
 
     private static void checkKeys(JsonNode node, Set<String> known, String origin, String prefix) throws PolicyException {
@@ -225,6 +260,13 @@ public record Policy(
         extra.removeAll(BUILT_IN_BLOCKED_FUNCTIONS);
         sb.append("blocked_functions: ").append(sorted(extra))
                 .append("   # plus ").append(BUILT_IN_BLOCKED_FUNCTIONS.size()).append(" built-in\n");
+        try {
+            // JSON arrays are valid YAML, and this quotes the questions safely
+            sb.append("examples: ").append(new ObjectMapper().writeValueAsString(examples)).append('\n');
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+        sb.append("share_results_with_ai: ").append(shareResultsWithAi).append('\n');
         sb.append("limits:\n");
         sb.append("  max_rows: ").append(maxRows).append('\n');
         sb.append("  timeout_ms: ").append(timeoutMillis).append('\n');
@@ -263,12 +305,12 @@ public record Policy(
 
     public Policy withMaxRows(int rows) {
         return new Policy(schema, allowedTables, blockedColumns, maskedColumns, rows, timeoutMillis,
-                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions);
+                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi);
     }
 
     public Policy withTimeoutMillis(int ms) {
         return new Policy(schema, allowedTables, blockedColumns, maskedColumns, maxRows, ms,
-                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions);
+                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi);
     }
 
     static String norm(String s) {

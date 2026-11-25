@@ -34,6 +34,23 @@ masked_columns: [email, phone]
 # functions (pg_sleep, pg_read_file, set_config, dblink, ...), which always applies.
 blocked_functions: []
 
+# Example questions shown under the question box on the web page (at most 12).
+# Leave this out and the web page asks Claude to suggest examples that fit the tables above.
+examples:
+  - How many orders are there per status?
+  - Top 5 customers by total spend on delivered orders
+  - Monthly revenue in 2025
+  - Revenue by product category
+  - Which country has the most customers?
+  - Average order value by month in 2025
+
+# Whether Claude may see query results, to write a one-line summary of each answer.
+# true:  up to 50 result rows are sent to the Anthropic API, after masking.
+# false: results never leave this machine; Claude only suggests follow-up questions,
+#        based on the question, the SQL and the column names.
+# The demo data is fake, so it's on here. Think before turning it on for real data.
+share_results_with_ai: true
+
 limits:
   max_rows: 200             # results are cut to this many rows
   timeout_ms: 3000          # each query is cancelled after this long

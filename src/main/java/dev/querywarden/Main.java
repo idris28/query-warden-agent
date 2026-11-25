@@ -88,7 +88,14 @@ public final class Main {
                 QueryWardenAgent agent = new QueryWardenAgent(cfg, pool, policy, new ClaudeSqlGenerator(fallbacks),
                         3, Path.of("audit.jsonl"));
                 List<Database.TableInfo> tables = Database.schemaInfo(cfg, policy);
-                new WebServer(agent, policy, pool, () -> tables, opts).start();
+                AiHelper ai = new ClaudeAiHelper(fallbacks);
+                if (policy.examples().isEmpty()) System.out.println("No examples in the policy; asking Claude to suggest some…");
+                WebServer.Examples examples = WebServer.resolveExamples(policy, ai, Database.formatSchema(tables));
+                System.out.println("Example questions: " + examples.questions().size() + " (from " + examples.source() + ")");
+                System.out.println("Result summaries: " + (policy.shareResultsWithAi()
+                        ? "on (up to 50 masked result rows are sent to Claude per answer)"
+                        : "off (results stay on this computer; Claude only suggests follow-ups)"));
+                new WebServer(agent, policy, pool, () -> tables, ai, examples, opts).start();
                 System.out.println("QueryWarden is running at http://localhost:" + opts.port()
                         + "  (only reachable from this computer; Ctrl-C to stop)");
             }
