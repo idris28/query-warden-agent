@@ -6,18 +6,34 @@ public interface SqlGenerator {
     /** What the model returns for each turn (structured output). */
     /** One model turn. {@code usage} is the tokens and cost of that call ({@link Usage#NONE} if unknown). */
     record Output(boolean answerable, String sql, String explanation, String reason, Usage usage,
-                  String interpretedQuestion) {
+                  String interpretedQuestion, String clarifyingQuestion, java.util.List<String> options) {
         public Output {
             if (usage == null) usage = Usage.NONE;
             if (interpretedQuestion == null) interpretedQuestion = "";
+            if (clarifyingQuestion == null) clarifyingQuestion = "";
+            options = options == null ? java.util.List.of() : java.util.List.copyOf(options);
+        }
+
+        public Output(boolean answerable, String sql, String explanation, String reason, Usage usage,
+                      String interpretedQuestion) {
+            this(answerable, sql, explanation, reason, usage, interpretedQuestion, "", java.util.List.of());
+        }
+
+        /** Claude asks the user to choose between readings instead of answering. */
+        public static Output clarify(String question, java.util.List<String> options) {
+            return new Output(false, "", "", "", Usage.NONE, "", question, options);
+        }
+
+        public boolean asksToClarify() {
+            return !clarifyingQuestion.isBlank();
         }
 
         public Output(boolean answerable, String sql, String explanation, String reason) {
-            this(answerable, sql, explanation, reason, Usage.NONE, "");
+            this(answerable, sql, explanation, reason, Usage.NONE, "", "", java.util.List.of());
         }
 
         public Output(boolean answerable, String sql, String explanation, String reason, Usage usage) {
-            this(answerable, sql, explanation, reason, usage, "");
+            this(answerable, sql, explanation, reason, usage, "", "", java.util.List.of());
         }
     }
 

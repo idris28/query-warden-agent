@@ -38,7 +38,24 @@ public record Policy(
         List<String> examples,
         boolean shareResultsWithAi,
         Map<String, String> definitions,
-        boolean shareCategoryValues) {
+        boolean shareCategoryValues,
+        boolean askClarifyingQuestions,
+        Map<String, Metric> metrics,
+        int maxTablesInPrompt) {
+
+    /**
+     * A measure defined as data: always computed with exactly this SQL.
+     * The query is {@code SELECT <sql> AS <name> FROM <from> [WHERE <where>]}; Claude adds grouping and
+     * time filters around it. {@code timeColumn} is the column to use for "per month", "in 2025", ….
+     */
+    public record Metric(String description, String sql, String from, String where, String timeColumn) {
+        public String query(String name) {
+            return "SELECT " + sql + " AS " + name + " FROM " + from + (where.isEmpty() ? "" : " WHERE " + where);
+        }
+    }
+
+    public static final int MAX_METRICS = 40;
+    private static final Set<String> METRIC_KEYS = Set.of("description", "sql", "from", "where", "time_column");
 
     /** Dangerous PostgreSQL functions. Always blocked; a policy file can only add to this list. */
     public static final Set<String> BUILT_IN_BLOCKED_FUNCTIONS = Set.of(
@@ -54,13 +71,28 @@ public record Policy(
             "dblink", "dblink_exec", "query_to_xml", "query_to_json",
             "table_to_xml", "cursor_to_xml", "xmlparse");
 
-    /** Built-in policy for the demo {@code shop} database. The shipped policy.yaml matches it. */
+    /**
+     * The starting point for any policy file: nothing about a particular database. A policy file must
+     * list its own {@code allowed_tables} ({@code querywarden init} writes one from the database).
+     */
     public static Policy defaults() {
-        return new Policy(
-                "shop",
+        return base("public", Set.of(), Map.of(), Set.of());
+    }
+
+    /** The policy for the sample {@code shop} database that {@code setup} creates (and tests use). */
+    public static Policy demo() {
+        return base("shop",
                 Set.of("customers", "products", "orders", "order_items", "employees"),
                 Map.of("employees", Set.of("salary", "ssn")),
-                Set.of("email", "phone"),
+                Set.of("email", "phone"));
+    }
+
+    private static Policy base(String schema, Set<String> tables, Map<String, Set<String>> blocked, Set<String> masked) {
+        return new Policy(
+                schema,
+                tables,
+                blocked,
+                masked,
                 200,
                 3000,
                 4,
@@ -71,7 +103,21 @@ public record Policy(
                 List.of(),     // no examples: the web page asks Claude to suggest some
                 false,         // result rows never leave this machine unless the policy says so
                 Map.of(),      // no business definitions
-                false);        // category values (e.g. country codes) aren't sent to Claude unless the policy says so
+                false,         // category values (e.g. country codes) aren't sent to Claude unless the policy says so
+                true,          // ask a short clarifying question when a question is genuinely ambiguous
+                Map.of(),      // no structured metrics
+                30);           // above this many tables, only the relevant ones are sent with each question
+    }
+
+    /** The metrics as prompt text, or "" when there are none. */
+    public String metricsText() {
+        StringBuilder sb = new StringBuilder();
+        metrics.forEach((name, m) -> {
+            sb.append("- ").append(name).append(": ").append(m.description()).append('\n')
+              .append("  ").append(m.query(name)).append('\n');
+            if (!m.timeColumn().isEmpty()) sb.append("  time column: ").append(m.timeColumn()).append('\n');
+        });
+        return sb.toString().strip();
     }
 
     public static final int MAX_EXAMPLES = 12;
@@ -104,16 +150,18 @@ public record Policy(
 
     private static final Set<String> TOP_KEYS = Set.of(
             "schema", "allowed_tables", "blocked_columns", "masked_columns", "blocked_functions", "limits",
-            "examples", "share_results_with_ai", "definitions", "share_category_values");
+            "examples", "share_results_with_ai", "definitions", "share_category_values",
+            "ask_clarifying_questions", "metrics");
     private static final Set<String> LIMIT_KEYS = Set.of(
-            "max_rows", "timeout_ms", "max_joins", "max_selects", "max_question_chars", "max_sql_chars");
+            "max_rows", "timeout_ms", "max_joins", "max_selects", "max_question_chars", "max_sql_chars",
+            "max_tables_in_prompt");
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*");
 
     /**
      * Finds the policy to use, in this order:
      * the {@code --policy} path if given, then the {@code QW_POLICY} environment variable,
-     * then {@code policy.yaml} in the current directory, then the built-in {@link #defaults()}.
-     * A path given explicitly (flag or variable) must exist.
+     * then {@code policy.yaml} in the current directory. A path given explicitly (flag or variable) must
+     * exist; with no file at all, there is no policy ({@code querywarden init} creates one).
      */
     public static Loaded resolve(String cliPath) throws PolicyException {
         if (cliPath != null && !cliPath.isBlank()) return new Loaded(load(Path.of(cliPath)), cliPath, Path.of(cliPath));
@@ -121,7 +169,9 @@ public record Policy(
         if (env != null && !env.isBlank()) return new Loaded(load(Path.of(env)), env + " (from QW_POLICY)", Path.of(env));
         Path local = Path.of(DEFAULT_FILE);
         if (Files.isRegularFile(local)) return new Loaded(load(local), DEFAULT_FILE, local);
-        return new Loaded(defaults(), "built-in defaults (no " + DEFAULT_FILE + " found)", null);
+        throw new PolicyException("No " + DEFAULT_FILE + " found. Create one from your database with:\n"
+                + "  java -jar target/querywarden.jar init\n"
+                + "(or point to one with --policy FILE or QW_POLICY).");
     }
 
     /** Reads and validates a YAML policy file. Keys that are left out keep their default values. */
@@ -136,6 +186,11 @@ public record Policy(
 
     /** Parses YAML policy text. {@code origin} is only used in error messages. */
     public static Policy parse(String yaml, String origin) throws PolicyException {
+        return parse(defaults(), yaml, origin);
+    }
+
+    /** Parses YAML policy text on top of {@code base}: keys left out keep the base's values. */
+    public static Policy parse(Policy base, String yaml, String origin) throws PolicyException {
         JsonNode root;
         try {
             root = new ObjectMapper(new YAMLFactory()).readTree(yaml);
@@ -143,8 +198,8 @@ public record Policy(
             String msg = e.getMessage() == null ? "" : e.getMessage().lines().findFirst().orElse("");
             throw new PolicyException(origin + ": not valid YAML: " + msg);
         }
-        Policy d = defaults();
-        if (root == null || root.isMissingNode() || root.isNull()) return d;
+        Policy d = base;
+        if (root == null || root.isMissingNode() || root.isNull()) root = new ObjectMapper().createObjectNode();
         if (!root.isObject()) throw new PolicyException(origin + ": expected key: value pairs at the top level.");
         checkKeys(root, TOP_KEYS, origin, "");
 
@@ -214,6 +269,12 @@ public record Policy(
                 throw new PolicyException(origin + ": definitions: at most " + MAX_DEFINITIONS + " terms (got " + m.size() + ").");
             definitions = java.util.Collections.unmodifiableMap(m);
         }
+        boolean clarify = d.askClarifyingQuestions();
+        if (root.has("ask_clarifying_questions") && !root.get("ask_clarifying_questions").isNull()) {
+            JsonNode cq = root.get("ask_clarifying_questions");
+            if (!cq.isBoolean()) throw new PolicyException(origin + ": ask_clarifying_questions must be true or false.");
+            clarify = cq.asBoolean();
+        }
         boolean categories = d.shareCategoryValues();
         if (root.has("share_category_values") && !root.get("share_category_values").isNull()) {
             JsonNode cv = root.get("share_category_values");
@@ -227,12 +288,38 @@ public record Policy(
             share = sh.asBoolean();
         }
 
+        Map<String, Metric> metrics = new LinkedHashMap<>();
+        if (root.has("metrics") && !root.get("metrics").isNull()) {
+            JsonNode ms = root.get("metrics");
+            if (!ms.isObject())
+                throw new PolicyException(origin + ": metrics must map a name to its description, sql and from.");
+            for (Iterator<Map.Entry<String, JsonNode>> it = ms.fields(); it.hasNext(); ) {
+                var e = it.next();
+                String name = identifierText(e.getKey(), origin, "metrics");
+                JsonNode m = e.getValue();
+                if (!m.isObject())
+                    throw new PolicyException(origin + ": metrics." + name + " needs description, sql and from.");
+                checkKeys(m, METRIC_KEYS, origin, "metrics." + name + ".");
+                metrics.put(name, new Metric(
+                        metricText(m, "description", true, origin, name),
+                        metricText(m, "sql", true, origin, name),
+                        metricText(m, "from", true, origin, name),
+                        metricText(m, "where", false, origin, name),
+                        metricText(m, "time_column", false, origin, name)));
+            }
+            if (metrics.size() > MAX_METRICS)
+                throw new PolicyException(origin + ": metrics: at most " + MAX_METRICS + " (got " + metrics.size() + ").");
+        }
+
         JsonNode limits = root.path("limits");
         if (!limits.isMissingNode() && !limits.isNull()) {
             if (!limits.isObject()) throw new PolicyException(origin + ": limits must be a set of key: value pairs.");
             checkKeys(limits, LIMIT_KEYS, origin, "limits.");
         }
-        return new Policy(
+        if (allowed.isEmpty())
+            throw new PolicyException(origin + ": allowed_tables must list the tables QueryWarden may query. "
+                    + "`querywarden init` writes a policy with them from your database.");
+        Policy p = new Policy(
                 schema, Set.copyOf(allowed), Map.copyOf(blocked), Set.copyOf(masked),
                 limit(limits, "max_rows", d.maxRows(), 1, 10_000, origin),
                 limit(limits, "timeout_ms", d.timeoutMillis(), 100, 600_000, origin),
@@ -244,7 +331,34 @@ public record Policy(
                 examples,
                 share,
                 definitions,
-                categories);
+                categories,
+                clarify,
+                java.util.Collections.unmodifiableMap(metrics),
+                limit(limits, "max_tables_in_prompt", d.maxTablesInPrompt(), 1, 10_000, origin));
+        // every metric must pass the same checks as Claude's SQL: allowed tables and columns only
+        SqlValidator validator = new SqlValidator(p);
+        for (var e : p.metrics().entrySet()) {
+            try {
+                validator.validate(e.getValue().query(e.getKey()));
+            } catch (SqlValidator.ValidationException ex) {
+                throw new PolicyException(origin + ": metrics." + e.getKey() + " is not allowed: " + ex.getMessage());
+            }
+        }
+        return p;
+    }
+
+    private static String metricText(JsonNode m, String key, boolean required, String origin, String name)
+            throws PolicyException {
+        JsonNode n = m.get(key);
+        if (n == null || n.isNull() || (n.isTextual() && n.asText().isBlank())) {
+            if (required) throw new PolicyException(origin + ": metrics." + name + "." + key + " is required.");
+            return "";
+        }
+        if (!n.isTextual()) throw new PolicyException(origin + ": metrics." + name + "." + key + " must be text.");
+        String t = n.asText().strip().replaceAll("\\s+", " ");
+        if (t.length() > 1000) throw new PolicyException(origin + ": metrics." + name + "." + key + " is too long.");
+        if (t.contains(";")) throw new PolicyException(origin + ": metrics." + name + "." + key + " must not contain ';'.");
+        return t;
     }
 
     private static void checkKeys(JsonNode node, Set<String> known, String origin, String prefix) throws PolicyException {
@@ -313,10 +427,29 @@ public record Policy(
         }
         sb.append("share_results_with_ai: ").append(shareResultsWithAi).append('\n');
         sb.append("share_category_values: ").append(shareCategoryValues).append('\n');
+        sb.append("ask_clarifying_questions: ").append(askClarifyingQuestions).append('\n');
         try {
             sb.append("definitions: ").append(new ObjectMapper().writeValueAsString(definitions)).append('\n');
         } catch (IOException e) {
             throw new IllegalStateException(e);
+        }
+        if (!metrics.isEmpty()) {
+            sb.append("metrics:\n");
+            try {
+                ObjectMapper j = new ObjectMapper();
+                for (var e : metrics.entrySet()) {
+                    Metric m = e.getValue();
+                    sb.append("  ").append(e.getKey()).append(":\n");
+                    sb.append("    description: ").append(j.writeValueAsString(m.description())).append('\n');
+                    sb.append("    sql: ").append(j.writeValueAsString(m.sql())).append('\n');
+                    sb.append("    from: ").append(j.writeValueAsString(m.from())).append('\n');
+                    if (!m.where().isEmpty()) sb.append("    where: ").append(j.writeValueAsString(m.where())).append('\n');
+                    if (!m.timeColumn().isEmpty())
+                        sb.append("    time_column: ").append(j.writeValueAsString(m.timeColumn())).append('\n');
+                }
+            } catch (IOException e) {
+                throw new IllegalStateException(e);
+            }
         }
         sb.append("limits:\n");
         sb.append("  max_rows: ").append(maxRows).append('\n');
@@ -325,6 +458,7 @@ public record Policy(
         sb.append("  max_selects: ").append(maxSelects).append('\n');
         sb.append("  max_question_chars: ").append(maxQuestionChars).append('\n');
         sb.append("  max_sql_chars: ").append(maxSqlChars).append('\n');
+        sb.append("  max_tables_in_prompt: ").append(maxTablesInPrompt).append('\n');
         return sb.toString();
     }
 
@@ -356,12 +490,12 @@ public record Policy(
 
     public Policy withMaxRows(int rows) {
         return new Policy(schema, allowedTables, blockedColumns, maskedColumns, rows, timeoutMillis,
-                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi, definitions, shareCategoryValues);
+                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi, definitions, shareCategoryValues, askClarifyingQuestions, metrics, maxTablesInPrompt);
     }
 
     public Policy withTimeoutMillis(int ms) {
         return new Policy(schema, allowedTables, blockedColumns, maskedColumns, maxRows, ms,
-                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi, definitions, shareCategoryValues);
+                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi, definitions, shareCategoryValues, askClarifyingQuestions, metrics, maxTablesInPrompt);
     }
 
     static String norm(String s) {

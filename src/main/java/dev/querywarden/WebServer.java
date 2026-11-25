@@ -168,6 +168,14 @@ public final class WebServer {
             config.routes.post("/api/review/verify", this::verify);
             config.routes.post("/api/review/dismiss", this::dismiss);
             config.routes.post("/api/review/remove", this::removeVerified);
+            config.routes.get("/api/settings/edit", this::editableSettings);
+            config.routes.post("/api/settings/preview", ctx -> changeSettings(ctx, false));
+            config.routes.post("/api/settings/save", ctx -> changeSettings(ctx, true));
+            config.routes.post("/api/settings/undo", this::undoSettings);
+            config.routes.get("/api/saved", this::listSaved);
+            config.routes.post("/api/saved", this::addSaved);
+            config.routes.post("/api/saved/run", this::runSaved);
+            config.routes.post("/api/saved/remove", this::removeSaved);
             config.routes.exception(Exception.class, (e, ctx) -> {
                 System.err.println("web: unexpected error on " + ctx.path() + ": " + e);
                 json(ctx, 500, Map.of("status", "failed", "message", "Something went wrong on the server."));
@@ -287,6 +295,8 @@ public final class WebServer {
         out.put("name", ctx.attribute("user"));
         out.put("sharing", options.sharing());
         out.put("reviewer", isReviewer(ctx));
+        out.put("saved", saved != null);
+        out.put("can_edit_settings", !editableKeys(ctx).isEmpty());
         out.put("feedback", feedback != null);
         json(ctx, 200, out);
     }
@@ -353,7 +363,8 @@ public final class WebServer {
     }
 
     /** A question plus earlier turns of the same conversation (for follow-ups). */
-    record Request(String question, List<QueryWardenAgent.Turn> history) {}
+    /** {@code clarified}: this question answers a clarifying question, so Claude must not ask again. */
+    record Request(String question, List<QueryWardenAgent.Turn> history, boolean clarified) {}
 
     /**
      * Reads {"question": "...", "history": [{"question": "...", "sql": "..."}]} and applies the rate and
@@ -366,12 +377,18 @@ public final class WebServer {
             return null;
         }
         String question;
+        boolean clarified = false;
         List<QueryWardenAgent.Turn> history = new ArrayList<>();
         try {
             JsonNode body = JSON.readTree(ctx.body());
             JsonNode q = body == null ? null : body.get("question");
             if (q == null || !q.isTextual()) throw new IllegalArgumentException();
             question = q.asText();
+            JsonNode cl = body.path("clarified");
+            if (!cl.isMissingNode() && !cl.isNull()) {
+                if (!cl.isBoolean()) throw new IllegalArgumentException();
+                clarified = cl.asBoolean();
+            }
             JsonNode h = body.path("history");
             if (!h.isMissingNode() && !h.isNull()) {
                 if (!h.isArray() || h.size() > 10) throw new IllegalArgumentException();
@@ -393,7 +410,7 @@ public final class WebServer {
             json(ctx, 503, failed("QueryWarden is busy with other questions. Please try again in a few seconds."));
             return null;
         }
-        return new Request(question, history);   // caller must release inFlight
+        return new Request(question, history, clarified);   // caller must release inFlight
     }
 
     private void ask(Context ctx) {
@@ -405,7 +422,7 @@ public final class WebServer {
         long start = System.nanoTime();
         QueryWardenAgent.Result r;
         try {
-            r = rt.agent().ask(question, client, p -> { }, req.history());
+            r = rt.agent().ask(question, client, p -> { }, req.history(), !req.clarified());
         } finally {
             inFlight.release();
         }
@@ -447,7 +464,8 @@ public final class WebServer {
             };
             long start = System.nanoTime();
             QueryWardenAgent.Result r = rt.agent().ask(question, client,
-                    p -> send.accept(Map.of("type", "progress", "stage", p.stage(), "text", p.text())), req.history());
+                    p -> send.accept(Map.of("type", "progress", "stage", p.stage(), "text", p.text())), req.history(),
+                    !req.clarified());
             Map<String, Object> result = new LinkedHashMap<>(toJson(r, (System.nanoTime() - start) / 1_000_000));
             result.put("type", "result");
             send.accept(result);
@@ -512,6 +530,7 @@ public final class WebServer {
         limits.put("max_selects", rt.policy().maxSelects());
         limits.put("max_question_chars", rt.policy().maxQuestionChars());
         limits.put("max_sql_chars", rt.policy().maxSqlChars());
+        limits.put("max_tables_in_prompt", rt.policy().maxTablesInPrompt());
 
         Map<String, Object> pol = new LinkedHashMap<>();
         pol.put("source", rt.policySource() != null ? rt.policySource() : policySource);
@@ -526,8 +545,17 @@ public final class WebServer {
         pol.put("share_results_with_ai", rt.policy().shareResultsWithAi());
         pol.put("definitions", rt.policy().definitions());
         pol.put("share_category_values", rt.policy().shareCategoryValues());
+        pol.put("ask_clarifying_questions", rt.policy().askClarifyingQuestions());
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        rt.policy().metrics().forEach((name, m) -> metrics.put(name, Map.of("description", m.description(),
+                "sql", m.query(name), "time_column", m.timeColumn())));
+        pol.put("metrics", metrics);
+        pol.put("tables_per_question", rt.tables().size() > rt.policy().maxTablesInPrompt()
+                ? "the most relevant " + rt.policy().maxTablesInPrompt() + " of " + rt.tables().size()
+                : "all " + rt.tables().size());
 
         Map<String, Object> ai = new LinkedHashMap<>();
+        ModelSettings models = currentModels();
         ai.put("sql_model", models.sqlModel());
         ai.put("sql_effort", models.sqlEffort());
         ai.put("helper_model", models.helperModel());
@@ -553,11 +581,13 @@ public final class WebServer {
         out.put("models", ai);
         out.put("web", web);
         out.put("live", liveStatus.get());
-        out.put("how_to_change", Boolean.TRUE.equals(liveStatus.get().get("enabled"))
-                ? "Edit policy.yaml and it is picked up within 30 seconds, as are new tables or columns in the database. "
-                        + "Model settings (QW_* variables) need a restart. Nothing can be changed from this page."
-                : "Edit policy.yaml (rules) or the QW_* environment variables (models), then restart `querywarden serve`. "
-                        + "Settings can't be changed from the page.");
+        out.put("undo_available", editor != null && !options.sharing() && editor.backupCount() > 0);
+        out.put("how_to_change", editor != null
+                ? "Changes made here are saved to " + editor.file().getFileName() + " (with a backup) and apply within seconds. "
+                        + "You can also edit the file directly; it is picked up within 30 seconds."
+                : Boolean.TRUE.equals(liveStatus.get().get("enabled"))
+                        ? "Edit policy.yaml and it is picked up within 30 seconds."
+                        : "Edit policy.yaml (rules) or the QW_* environment variables (models), then restart `querywarden serve`.");
         json(ctx, 200, out);
     }
 
@@ -589,6 +619,289 @@ public final class WebServer {
         }
         Examples e = exampleRefresher.get();
         json(ctx, 200, Map.of("examples", e.questions(), "examples_source", e.source()));
+    }
+
+    // ------------------------------------------------------------------ changing settings from the page
+    private volatile PolicyEditor editor = null;
+    private volatile ModelSwitch modelSwitch = null;
+    private volatile Runnable applyNow = () -> { };
+
+    /** Lets the Settings panel change policy.yaml (through {@code editor}) and the models, applying them at once. */
+    public WebServer withEditing(PolicyEditor editor, ModelSwitch models, Runnable applyNow) {
+        this.editor = editor;
+        this.modelSwitch = models;
+        this.applyNow = applyNow == null ? () -> { } : applyNow;
+        return this;
+    }
+
+    private ModelSettings currentModels() {
+        return modelSwitch != null ? modelSwitch.current() : models;
+    }
+
+    /**
+     * What this person may change: on the page that only runs on this computer, everything; on a shared
+     * page, reviewers may change definitions, metrics, examples, clarifying questions and limits, while
+     * the rules about what data can be seen and the models stay with the computer's owner.
+     */
+    private Set<String> editableKeys(Context ctx) {
+        if (editor == null) return Set.of();
+        if (!options.sharing()) {
+            Set<String> all = new java.util.TreeSet<>(PolicyEditor.CONTENT_KEYS);
+            all.addAll(PolicyEditor.RULE_KEYS);
+            return all;
+        }
+        return isReviewer(ctx) ? PolicyEditor.CONTENT_KEYS : Set.of();
+    }
+
+    private boolean modelsEditable() {
+        return modelSwitch != null && !options.sharing();
+    }
+
+    private void editableSettings(Context ctx) throws Exception {
+        Set<String> keys = editableKeys(ctx);
+        if (keys.isEmpty()) {
+            json(ctx, 403, failed(editor == null ? "Settings can't be changed here." : "Only reviewers can change settings."));
+            return;
+        }
+        String text = java.nio.file.Files.readString(editor.file());
+        Policy current = currentPolicy(text);
+        var values = PolicyEditor.values(current);
+        values.retain(keys);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("status", "ok");
+        out.put("file", editor.file().getFileName().toString());
+        out.put("editable", keys);
+        out.put("values", values);
+        out.put("backups", editor.backupCount());
+        out.put("models_editable", modelsEditable());
+        if (modelsEditable()) {
+            ModelSettings m = modelSwitch.current();
+            out.put("models", Map.of("sql_model", m.sqlModel(), "sql_effort", m.sqlEffort(),
+                    "helper_model", m.helperModel(), "helper_effort", m.helperEffort(), "saved_on_page", modelSwitch.savedOnPage()));
+            out.put("model_choices", List.of("claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-2",
+                    "claude-opus-5", "claude-sonnet-5"));
+            out.put("efforts", List.of("low", "medium", "high", "xhigh", "max"));
+        }
+        if (keys.contains("allowed_tables")) out.put("tables", tablesInSchema(current.schema()));
+        json(ctx, 200, out);
+    }
+
+    /** The policy as the file says now (the runtime's copy if the file is broken). */
+    private Policy currentPolicy(String text) {
+        try {
+            return Policy.parse(text, editor.file().getFileName().toString());
+        } catch (Policy.PolicyException e) {
+            return runtime.get().policy();
+        }
+    }
+
+    /** Every table and view in the schema with its column names, allowed or not (names only, no data). */
+    private List<Map<String, Object>> tablesInSchema(String schema) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        String sql = """
+                SELECT c.relname, a.attname FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+                WHERE n.nspname = ? AND c.relkind IN ('r', 'v', 'm', 'p')
+                ORDER BY c.relname, a.attnum""";
+        try (var c = agentConnections.getConnection(); var ps = c.prepareStatement(sql)) {
+            ps.setString(1, schema);
+            Map<String, List<String>> cols = new LinkedHashMap<>();
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) cols.computeIfAbsent(rs.getString(1), k -> new ArrayList<>()).add(rs.getString(2));
+            }
+            cols.forEach((t, cs) -> out.add(Map.of("name", t, "columns", cs)));
+        } catch (java.sql.SQLException e) {
+            System.err.println("web: couldn't list the tables of " + schema + ": " + e.getMessage());
+        }
+        return out;
+    }
+
+    private void changeSettings(Context ctx, boolean save) throws Exception {
+        Set<String> keys = editableKeys(ctx);
+        if (keys.isEmpty()) { json(ctx, 403, failed("Only reviewers can change settings.")); return; }
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        if (!allow(limitKey(ctx))) { json(ctx, 429, failed("Too many requests. Please wait a moment.")); return; }
+        String text = java.nio.file.Files.readString(editor.file());
+        Policy current = currentPolicy(text);
+        PolicyEditor.Edit edit;
+        List<PolicyEditor.Change> modelChanges = new ArrayList<>();
+        Map<String, String> wantModels = new LinkedHashMap<>();
+        try {
+            edit = PolicyEditor.apply(text, current, b.has("policy") ? b.get("policy") : JSON.createObjectNode(), keys);
+            JsonNode m = b.get("models");
+            if (m != null && !m.isNull()) {
+                if (!modelsEditable()) throw new IllegalArgumentException("Models can only be changed on the computer QueryWarden runs on.");
+                ModelSettings now = modelSwitch.current();
+                for (String k : List.of("sql_model", "sql_effort", "helper_model", "helper_effort")) {
+                    String v = m.path(k).asText("").strip();
+                    String was = switch (k) {
+                        case "sql_model" -> now.sqlModel();
+                        case "sql_effort" -> now.sqlEffort();
+                        case "helper_model" -> now.helperModel();
+                        default -> now.helperEffort();
+                    };
+                    if (!v.isEmpty() && !v.equals(was)) {
+                        wantModels.put(k, v);
+                        modelChanges.add(new PolicyEditor.Change("models", k.replace('_', ' ') + ": " + was + " → " + v, false));
+                    }
+                }
+                if (!wantModels.isEmpty()) ModelSettings.fromMap(Map.of(   // check before saving anything
+                        "QW_SQL_MODEL", wantModels.getOrDefault("sql_model", now.sqlModel()),
+                        "QW_SQL_EFFORT", wantModels.getOrDefault("sql_effort", now.sqlEffort()),
+                        "QW_HELPER_MODEL", wantModels.getOrDefault("helper_model", now.helperModel()),
+                        "QW_HELPER_EFFORT", wantModels.getOrDefault("helper_effort", now.helperEffort())));
+            }
+        } catch (Policy.PolicyException | IllegalArgumentException e) {
+            json(ctx, 200, Map.of("status", "invalid", "message", e.getMessage()));
+            return;
+        }
+        List<PolicyEditor.Change> all = new ArrayList<>(edit.changes());
+        all.addAll(modelChanges);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("changes", all.stream().map(c -> Map.of("key", c.key(), "text", c.text(), "widens", c.widens())).toList());
+        out.put("needs_confirm", edit.widens());
+        out.put("grants_note", edit.touchesRules()
+                ? "The database user's permissions don't change by themselves: run `querywarden grants` and apply the SQL, "
+                        + "then `querywarden doctor` to check." : "");
+        if (!save || all.isEmpty()) {
+            out.put("status", all.isEmpty() ? "unchanged" : "ok");
+            json(ctx, 200, out);
+            return;
+        }
+        if (edit.widens() && !b.path("confirm").asBoolean(false)) {
+            out.put("status", "confirm");
+            out.put("message", "These changes let more data be seen or leave this computer. Confirm to save them.");
+            json(ctx, 200, out);
+            return;
+        }
+        if (!edit.changes().isEmpty()) out.put("backup", editor.save(edit, who(ctx)));
+        if (!wantModels.isEmpty()) modelSwitch.save(wantModels);
+        applyNow.run();
+        out.put("status", "ok");
+        json(ctx, 200, out);
+    }
+
+    private void undoSettings(Context ctx) throws Exception {
+        if (editableKeys(ctx).isEmpty()) { json(ctx, 403, failed("Only reviewers can change settings.")); return; }
+        // a backup may differ in any section, rules included, so only the computer's owner can restore one
+        if (options.sharing()) { json(ctx, 403, failed("Undo is only available on the computer QueryWarden runs on.")); return; }
+        try {
+            String text = java.nio.file.Files.readString(editor.file());
+            var changes = editor.undo(who(ctx), currentPolicy(text));
+            applyNow.run();
+            json(ctx, 200, Map.of("status", "ok", "changes",
+                    changes.stream().map(c -> Map.of("key", c.key(), "text", c.text(), "widens", c.widens())).toList()));
+        } catch (IllegalStateException | Policy.PolicyException e) {
+            json(ctx, 200, Map.of("status", "invalid", "message", e.getMessage()));
+        }
+    }
+
+    // ------------------------------------------------------------------ saved questions and alerts
+    private volatile SavedScheduler saved = null;
+
+    /** Saved questions, their schedules and alerts (null: turned off). */
+    public WebServer withSaved(SavedScheduler scheduler) {
+        this.saved = scheduler;
+        return this;
+    }
+
+    private void listSaved(Context ctx) {
+        if (saved == null) { json(ctx, 404, failed("Saved questions are turned off.")); return; }
+        String me = who(ctx);
+        boolean reviewer = isReviewer(ctx);
+        List<Map<String, Object>> items = new ArrayList<>();
+        for (var s : saved.store().list()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", s.id());
+            m.put("name", s.name());
+            m.put("question", s.question());
+            m.put("sql", s.sql());
+            m.put("owner", s.owner());
+            m.put("created", s.created());
+            m.put("schedule", s.schedule());
+            m.put("alert", s.alert() == null ? null : s.alert().describe());
+            m.put("last_run", s.lastRun());
+            m.put("last_status", s.lastStatus());
+            m.put("last_value", s.lastValue());
+            m.put("alerting", s.alerting());
+            m.put("last_message", s.lastMessage());
+            m.put("can_remove", reviewer || s.owner().equals(me));
+            items.add(m);
+        }
+        List<Map<String, Object>> alerts = new ArrayList<>();
+        for (var a : saved.recentAlerts(20))
+            alerts.add(Map.of("at", a.at(), "saved_id", a.savedId(), "name", a.name(), "message", a.message()));
+        json(ctx, 200, Map.of("saved", items, "alerts", alerts, "webhook", saved.webhookConfigured()));
+    }
+
+    private void addSaved(Context ctx) throws Exception {
+        if (saved == null) { json(ctx, 404, failed("Saved questions are turned off.")); return; }
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        if (!allow(limitKey(ctx))) { json(ctx, 429, failed("Too many requests. Please wait a moment.")); return; }
+        Runtime rt = runtime.get();
+        String question, sql, name, schedule;
+        SavedQuestions.Alert alert = null;
+        try {
+            question = text(b, "question", rt.policy().maxQuestionChars());
+            sql = text(b, "sql", rt.policy().maxSqlChars());
+            name = text(b, "name", SavedQuestions.MAX_NAME_CHARS);
+            schedule = text(b, "schedule", 40);
+            JsonNode a = b.get("alert");
+            if (a != null && !a.isNull()) {
+                if (!a.isObject()) throw new IllegalArgumentException("alert");
+                JsonNode v = a.get("value");
+                if (v != null && !v.isNull() && !v.isNumber()) throw new IllegalArgumentException("The alert value must be a number.");
+                alert = new SavedQuestions.Alert(text(a, "column", 63), text(a, "op", 10),
+                        v == null || v.isNull() ? null : v.asDouble());
+            }
+            if (question.isBlank() || sql.isBlank()) throw new IllegalArgumentException("A saved question needs a question and its SQL.");
+            schedule = SavedQuestions.Schedule.normalise(schedule);
+        } catch (IllegalArgumentException e) {
+            String m = e.getMessage();
+            json(ctx, 400, failed(m != null && m.contains(" ") ? m : "Saving needs a question, its SQL and a valid schedule."));
+            return;
+        }
+        try {
+            new SqlValidator(rt.policy()).validate(sql);   // the same checks as every query; checked again on each run
+        } catch (SqlValidator.ValidationException e) {
+            json(ctx, 200, Map.of("status", "rejected", "message", e.getMessage()));
+            return;
+        }
+        var s = saved.store().add(name, question, sql, who(ctx), schedule, alert);
+        json(ctx, 200, Map.of("status", "ok", "id", s.id(), "schedule", s.schedule()));
+    }
+
+    /** Runs a saved question now, for the dashboard. Doesn't change its alert state (only scheduled runs do). */
+    private void runSaved(Context ctx) throws Exception {
+        if (saved == null) { json(ctx, 404, failed("Saved questions are turned off.")); return; }
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        if (!allow(limitKey(ctx))) { json(ctx, 429, failed("Too many requests. Please wait a moment.")); return; }
+        String id = b.path("id").asText("");
+        var s = saved.store().get(id);
+        if (s.isEmpty()) { json(ctx, 404, failed("That saved question no longer exists.")); return; }
+        long start = System.nanoTime();
+        var r = runtime.get().agent().runSaved(s.get().question(), s.get().sql(), client(ctx));
+        Map<String, Object> out = new LinkedHashMap<>(toJson(r, (System.nanoTime() - start) / 1_000_000));
+        out.put("id", id);
+        json(ctx, 200, out);
+    }
+
+    private void removeSaved(Context ctx) throws Exception {
+        if (saved == null) { json(ctx, 404, failed("Saved questions are turned off.")); return; }
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        var s = saved.store().get(b.path("id").asText(""));
+        if (s.isEmpty()) { json(ctx, 404, failed("That saved question no longer exists.")); return; }
+        if (!isReviewer(ctx) && !s.get().owner().equals(who(ctx))) {
+            json(ctx, 403, failed("Only the person who saved it, or a reviewer, can remove it."));
+            return;
+        }
+        saved.store().remove(s.get().id());
+        json(ctx, 200, Map.of("status", "ok"));
     }
 
     // ------------------------------------------------------------------ feedback and verified answers
@@ -773,6 +1086,7 @@ public final class WebServer {
         out.put("sql", r.sql());
         out.put("explanation", r.explanation());
         out.put("interpreted_question", r.interpretedQuestion() == null ? "" : r.interpretedQuestion());
+        out.put("clarify_options", r.clarifyOptions());
         out.put("verified", r.verified() == null ? null
                 : Map.of("kind", r.verified().kind(), "questions", r.verified().questions()));
         List<Map<String, String>> columns = new ArrayList<>();

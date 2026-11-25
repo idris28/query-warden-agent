@@ -56,6 +56,7 @@ public final class Doctor {
             creates(st, out);
             reads(c, policy, out);
             policyMatchesDatabase(c, policy, out);
+            metrics(c, policy, out);
         } catch (SQLException e) {
             out.add(new Finding(Level.FAIL, "A check couldn't run, so the result is incomplete: " + firstLine(e.getMessage())));
         }
@@ -193,6 +194,33 @@ public final class Doctor {
         }
         for (String t : policy.allowedTables())
             if (!cols.containsKey(t)) out.add(warn("Allowed table '" + t + "' doesn't exist in schema '" + policy.schema() + "'."));
+    }
+
+    /** Every metric runs as the agent user (read-only, one row), so typos show up here rather than mid-question. */
+    static void metrics(Connection c, Policy policy, List<Finding> out) throws SQLException {
+        if (policy.metrics().isEmpty()) return;
+        int ok = 0;
+        boolean ro = c.isReadOnly();
+        c.setReadOnly(true);
+        try (Statement st = c.createStatement()) {
+            st.execute("SET search_path TO " + policy.schema());
+            for (var e : policy.metrics().entrySet()) {
+                try {
+                    c.setAutoCommit(false);
+                    st.execute("SET LOCAL statement_timeout = " + policy.timeoutMillis());
+                    st.executeQuery(e.getValue().query(e.getKey()) + " LIMIT 1").close();
+                    ok++;
+                } catch (SQLException ex) {
+                    out.add(fail("Metric '" + e.getKey() + "' doesn't run: " + firstLine(ex.getMessage())));
+                } finally {
+                    c.rollback();
+                    c.setAutoCommit(true);
+                }
+            }
+        } finally {
+            c.setReadOnly(ro);
+        }
+        if (ok == policy.metrics().size()) out.add(pass("All " + ok + " metrics run."));
     }
 
     // ------------------------------------------------------------------ helpers

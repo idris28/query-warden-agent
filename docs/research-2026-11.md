@@ -15,23 +15,23 @@ Supabase assistant, Chat2DB and DB-GPT were only looked at lightly.
 | Defog SQLCoder | Original model marked outdated; Cloudflare deprecated sqlcoder-7b-2 on 30 May 2026 | https://huggingface.co/defog/sqlcoder ; https://developers.cloudflare.com/ai/models/@cf/defog/sqlcoder-7b-2/ |
 | Amazon QuickSight | Now Amazon Quick Suite | https://aws.amazon.com/blogs/business-intelligence/reimagine-business-intelligence-amazon-quicksight-evolves-to-amazon-quick-suite |
 
-## Features others have that QueryWarden doesn't (yet)
+## Features found in other tools, and where QueryWarden stands (updated 2026-11-26)
 
-| Feature | Found in | Why it matters | Source |
-|---|---|---|---|
-| Semantic layer: metrics, dimensions and joins defined as data | Snowflake semantic views, WrenAI MDL, Metabase metrics, Databricks Genie | Metric definitions are versioned and exact, which goes further than prose definitions | https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-analyst ; WrenAI README |
-| Library of verified question-and-SQL pairs used at answer time, marked "trusted" | Snowflake Cortex Analyst (verified queries), Genie (trusted assets), ThoughtSpot (reference questions), Amazon Quick (verified questions) | Recurring questions get the same, checked answer | https://docs.snowflake.com/en/user-guide/views-semantic/verified-query-repository ; https://learn.microsoft.com/da-dk/azure/databricks/genie/trusted-assets ; https://docs.thoughtspot.com/cloud/latest/spotter-coaching-options |
-| Clarifying questions instead of guessing | Genie | Ambiguous questions get the right answer, not a plausible one | https://docs.databricks.com/aws/en/genie/talk-to-genie |
-| Feedback: "Fix it", ask for review, expert corrects | Genie, ThoughtSpot (votes, conversation log) | Mistakes become curated examples | https://docs.databricks.com/aws/en/genie/talk-to-genie ; https://docs.thoughtspot.com/cloud/26.6.0.cl/spotter-coach-after |
-| Approve the SQL before it runs | LangChain (human-in-the-loop middleware) | Optional gate for sensitive data | https://docs.langchain.com/oss/python/langchain/sql-agent |
-| Queries run as the signed-in person (their permissions, row-level security) | Vanna 2.0, Looker/BigQuery agents, Metabot; WrenAI paid tier | In QueryWarden's shared mode everyone uses the same database user | https://github.com/vanna-ai/vanna ; https://docs.cloud.google.com/gemini/docs/conversational-analytics-api/known-limitations |
-| Slack and Teams | Genie, Metabot, Dataherald | Answers where people already work | https://docs.databricks.com/aws/en/genie-one/genie-slack ; https://docs.databricks.com/aws/en/integrations/msft-teams |
-| Alerts on a schedule | Metabot (set up from Slack) | Questions become monitoring | Metabase 60 announcement (dev.to, "metabase-60-we-made-ai-open-source…") |
-| MCP server | Metabase, WrenAI | Lets AI assistants use the same governed pipeline | same; WrenAI README |
-| Reusing saved questions and dashboards | Metabot looks for an existing question first; WrenAI dashboards | Fewer duplicate, inconsistent answers | https://www.metabase.com/features/metabot-ai |
-| Picking relevant tables for large schemas | LlamaIndex table retriever, WrenAI, LangChain | A full schema doesn't fit in the prompt | https://developers.llamaindex.ai/python/examples/index_structs/struct_indices/sqlindexdemo/ |
-| Many database types | WrenAI (22+ sources), Vanna | Wider use | WrenAI README ; https://github.com/vanna-ai/vanna |
-| Multi-step research reports, PDF export | Genie agent mode | "Why" questions, not only single queries | https://docs.databricks.com/aws/en/genie/talk-to-genie |
+| Feature | Found in | Why it matters | Source | QueryWarden today |
+|---|---|---|---|---|
+| Semantic layer: metrics, dimensions and joins defined as data | Snowflake semantic views, WrenAI MDL, Metabase metrics, Databricks Genie | Metric definitions are versioned and exact, which goes further than prose definitions | https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-analyst ; WrenAI README | Built: `metrics` in policy.yaml (expression, from, where, time column) |
+| Library of verified question-and-SQL pairs used at answer time, marked "trusted" | Snowflake Cortex Analyst (verified queries), Genie (trusted assets), ThoughtSpot (reference questions), Amazon Quick (verified questions) | Recurring questions get the same, checked answer | https://docs.snowflake.com/en/user-guide/views-semantic/verified-query-repository ; https://learn.microsoft.com/da-dk/azure/databricks/genie/trusted-assets ; https://docs.thoughtspot.com/cloud/latest/spotter-coaching-options | Built: verified answers with a Verified badge |
+| Clarifying questions instead of guessing | Genie | Ambiguous questions get the right answer, not a plausible one | https://docs.databricks.com/aws/en/genie/talk-to-genie | Built |
+| Feedback: "Fix it", ask for review, expert corrects | Genie, ThoughtSpot (votes, conversation log) | Mistakes become curated examples | https://docs.databricks.com/aws/en/genie/talk-to-genie ; https://docs.thoughtspot.com/cloud/26.6.0.cl/spotter-coach-after | Built: Correct / Wrong, review panel, verify |
+| Approve the SQL before it runs | LangChain (human-in-the-loop middleware) | Optional gate for sensitive data | https://docs.langchain.com/oss/python/langchain/sql-agent | Not yet |
+| Queries run as the signed-in person (their permissions, row-level security) | Vanna 2.0, Looker/BigQuery agents, Metabot; WrenAI paid tier | In QueryWarden's shared mode everyone uses the same database user | https://github.com/vanna-ai/vanna ; https://docs.cloud.google.com/gemini/docs/conversational-analytics-api/known-limitations | Not yet (shared mode uses one database user) |
+| Slack and Teams | Genie, Metabot, Dataherald | Answers where people already work | https://docs.databricks.com/aws/en/genie-one/genie-slack ; https://docs.databricks.com/aws/en/integrations/msft-teams | Partly: alerts can go to a Slack or Teams webhook (`QW_ALERT_WEBHOOK`); no bot |
+| Alerts on a schedule | Metabot (set up from Slack) | Questions become monitoring | Metabase 60 announcement (dev.to, "metabase-60-we-made-ai-open-source…") | Built: saved questions with schedules and alerts |
+| MCP server | Metabase, WrenAI | Lets AI assistants use the same governed pipeline | same; WrenAI README | Not yet |
+| Reusing saved questions and dashboards | Metabot looks for an existing question first; WrenAI dashboards | Fewer duplicate, inconsistent answers | https://www.metabase.com/features/metabot-ai | Built: saved questions and the Dashboard |
+| Picking relevant tables for large schemas | LlamaIndex table retriever, WrenAI, LangChain | A full schema doesn't fit in the prompt | https://developers.llamaindex.ai/python/examples/index_structs/struct_indices/sqlindexdemo/ | Built: above `limits.max_tables_in_prompt` (default 30) tables |
+| Many database types | WrenAI (22+ sources), Vanna | Wider use | WrenAI README ; https://github.com/vanna-ai/vanna | Not yet (PostgreSQL only) |
+| Multi-step research reports, PDF export | Genie agent mode | "Why" questions, not only single queries | https://docs.databricks.com/aws/en/genie/talk-to-genie | Not yet |
 
 ## Problems in those projects, and where QueryWarden stands
 
@@ -44,14 +44,16 @@ Supabase assistant, Chat2DB and DB-GPT were only looked at lightly.
 | Unauthenticated SQL API, permissive CORS, plugin-upload code execution (CVE-2024-10835, CVE-2024-10906, CVE-2025-51459) | DB-GPT | https://advisories.gitlab.com/pypi/dbgpt/CVE-2024-10835/ ; https://www.tenable.com/cve/CVE-2024-10906 ; https://nvd.nist.gov/vuln/detail/CVE-2025-51459 | Local-only by default; shared mode needs tokens; no cross-site access; no plugins |
 | SQL injection, vendor unresponsive (CVE-2025-9148, CVE-2026-4173) | Chat2DB | https://nvd.nist.gov/vuln/detail/CVE-2025-9148 ; https://vuldb.com/vuln/320527 (search summary) | As above |
 | "Lethal trifecta": an untrusted support ticket plus a connection that bypassed row-level security leaked data | Supabase MCP | https://generalanalysis.com/blog/supabase-mcp-blog ; https://simonwillison.net/2025/Jul/06/supabase-mcp-lethal-trifecta/ | Least-privilege user; AI text shown as plain text; the page's security policy blocks outside images and connections (checked: a test image request to another site was blocked) |
-| Only the first 100 tables are looked at; may invent table names | Metabot | https://www.metabase.com/docs/latest/ai/metabot | Sends every allowed table; unknown tables are rejected by the checks. Large schemas are not yet handled |
+| Only the first 100 tables are looked at; may invent table names | Metabot | https://www.metabase.com/docs/latest/ai/metabot | Up to 30 allowed tables (configurable) every table is sent; above that only the relevant ones, with the rest listed by name so Claude can ask for them. Unknown tables are rejected by the checks |
 | Follow-ups can't use earlier results; long conversations degrade | Cortex Analyst | https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-analyst | Follow-ups use the last three questions and their SQL; tested in the evaluation |
 | Row caps (1,000–5,000) and output limits | Google Conversational Analytics | https://docs.cloud.google.com/gemini/docs/conversational-analytics-api/known-limitations | Row cap is a policy setting (default 200) |
 | Low accuracy on real enterprise schemas (21.3% for o1-preview on Spider 2.0 when published; higher on later leaderboards) | General | https://arxiv.org/abs/2411.07763 ; https://spider2-sql.github.io/ | Measured with the evaluation set; it needs real questions from real users to say more |
 
 ## Recommended next steps for QueryWarden
 
-Items 1 and 2 were built on 2026-11-25 (see "Verified answers and feedback" in the README).
+Items 1 and 2 were built on 2026-11-25 (see "Verified answers and feedback" in the README),
+item 3 on 2026-11-26 (see "Clarifying questions"), and items 5, 6 and 8 on 2026-11-26 (see
+"Metrics", "Large databases" and "Saved questions, alerts and the dashboard"). Items 4 and 7 are open.
 
 1. **Verified answers library.** Save checked question-and-SQL pairs, show matching ones to Claude as
    examples, and mark answers that reuse them as "verified". Builds directly on the evaluation set.
@@ -64,4 +66,35 @@ Items 1 and 2 were built on 2026-11-25 (see "Verified answers and feedback" in t
    definitions.
 6. **Large schemas.** Pick the relevant tables for each question instead of sending all of them.
 7. **MCP server and Slack bot** that go through the same checks.
-8. **Saved questions with scheduled alerts**, leading to dashboards built from questions.
+8. **Saved questions with scheduled alerts**, leading to dashboards built from questions (built: the Dashboard).
+
+## Web page design (2026-11-26)
+
+A second survey looked at how these products present answers. Sources were mostly search summaries,
+apart from the Databricks Genie and Snowflake Intelligence documentation, which were read in full.
+
+- **Databricks Genie:** a chat thread. Each answer has an expandable analysis with the steps taken and
+  "Show code", then the result table and an optional chart. It has a *Trusted* label, Yes / Fix it /
+  Request review feedback, and Add to dashboard.
+  (https://docs.databricks.com/aws/en/genie/talk-to-genie)
+- **Snowflake Intelligence:** a chat whose answers trace back to their SQL. Verified answers carry a
+  green shield, and charts and tables can be saved.
+  (https://docs.snowflake.com/user-guide/snowflake-cortex/snowflake-intelligence)
+- **Looker conversational analytics:** a "How was this calculated?" panel. **ThoughtSpot Spotter:**
+  pin to a Liveboard. **WrenAI:** View SQL, and saved SQL becomes a trusted result. (Search summaries.)
+
+Their common feel is light by default, neutral greys with one accent colour, medium density, a narrow
+conversation column and full-width result cards.
+
+Adopted in QueryWarden's "Ledger" design:
+
+- the answer order: summary, numbers, chart, table, then the collapsible working
+- a live step list
+- a Verified badge kept apart from plain AI output
+- notes as chips
+- Correct / Wrong with review
+- follow-ups and clarifying choices as chips
+- Save to dashboard
+
+The page stays plain HTML, CSS and JavaScript: no build step, the strict Content-Security-Policy is
+unchanged, and it uses the system font with tabular figures.

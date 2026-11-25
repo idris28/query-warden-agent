@@ -11,125 +11,187 @@
 </head>
 <body>
   <div class="shell">
-    <aside class="side" aria-label="Recent questions and available data">
-      <a class="brand" href="/">QueryWarden</a>
+    <aside class="rail" aria-label="History, saved questions and data">
+      <div class="rail-top">
+        <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span>QueryWarden</a>
+      </div>
 
-      <section class="side-block" aria-labelledby="recent-heading">
-        <h2 id="recent-heading">Recent questions</h2>
-        <ol id="recent" class="recent"></ol>
+      <nav class="rail-nav" aria-label="Views">
+        <button id="dashboard-open" class="rail-link" type="button" hidden>Dashboard<span id="alert-count" class="alert-count" hidden></span></button>
+        <button id="review-open" class="rail-link" type="button" hidden>Review</button>
+      </nav>
+
+      <section class="rail-block" aria-labelledby="recent-heading">
+        <h2 id="recent-heading">Recent</h2>
+        <ol id="recent" class="rail-list recent"></ol>
         <p id="recent-empty" class="quiet">Questions you ask appear here.</p>
-        <button id="recent-clear" class="link-button" type="button" hidden>Clear recent questions</button>
+        <button id="recent-clear" class="link-button" type="button" hidden>Clear</button>
       </section>
 
-      <section class="side-block" aria-labelledby="data-heading">
-        <h2 id="data-heading">Data you can ask about</h2>
+      <section class="rail-block" id="rail-saved-block" aria-labelledby="saved-heading" hidden>
+        <h2 id="saved-heading">Saved</h2>
+        <ol id="rail-saved" class="rail-list saved-list"></ol>
+      </section>
+
+      <section class="rail-block" aria-labelledby="data-heading">
+        <h2 id="data-heading">Data</h2>
         <div id="tables" class="tables"><p class="quiet">Loading…</p></div>
       </section>
 
-      <section class="side-block">
+      <footer class="rail-foot">
         <p id="whoami" class="whoami" hidden>Signed in as <strong id="whoami-name"></strong></p>
-        <button id="review-open" class="secondary" type="button" hidden>Review</button>
-        <button id="settings-open" class="secondary" type="button">Settings</button>
+        <div class="rail-foot-row">
+          <button id="settings-open" class="rail-link" type="button">Settings</button>
+          <button id="theme-toggle" class="rail-link" type="button" aria-label="Colour theme">Theme: auto</button>
+        </div>
         <button id="sign-out" class="link-button" type="button" hidden>Sign out</button>
-      </section>
+      </footer>
     </aside>
 
     <main class="main">
-      <a class="brand brand-top" href="/">QueryWarden</a>
-      <form id="ask-form" class="ask" autocomplete="off">
-        <label for="question" class="ask-label">Ask a question about your data</label>
-        <textarea id="question" name="question" rows="2" required
-                  placeholder="Which customers spent the most last year?"></textarea>
-        <div class="ask-row">
-          <button id="ask-button" type="submit" class="primary">Ask</button>
-          <button id="new-conversation" type="button" class="secondary" hidden>New conversation</button>
-          <span class="hint">Enter to ask, Shift+Enter for a new line</span>
-        </div>
+      <div class="thread">
+        <a class="brand brand-top" href="/"><span class="brand-mark" aria-hidden="true"></span>QueryWarden</a>
+
+        <form id="ask-form" class="composer" autocomplete="off">
+          <label for="question" class="visually-hidden">Ask a question about your data</label>
+          <textarea id="question" name="question" rows="2" required
+                    placeholder="Ask a question about your data"></textarea>
+          <div class="composer-row">
+            <span class="hint">Enter to ask · Shift+Enter for a new line</span>
+            <button id="new-conversation" type="button" class="secondary" hidden>New conversation</button>
+            <button id="ask-button" type="submit" class="primary">Ask</button>
+          </div>
+        </form>
+
         <div class="examples" id="examples-wrap" hidden>
-          <span class="examples-label" id="examples-label">Try</span>
-          <ul id="examples" class="examples-list" aria-labelledby="examples-label"></ul>
+          <ul id="examples" class="chips" aria-label="Example questions"></ul>
           <button id="more-examples" type="button" class="link-button more-examples" hidden>More examples</button>
         </div>
-      </form>
 
-      <p id="status" class="status" role="status" aria-live="polite"></p>
-      <ol id="progress" class="progress" hidden aria-label="Progress"></ol>
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+        <ol id="progress" class="steps" hidden aria-label="Progress"></ol>
 
-      <article id="answer" class="answer" hidden aria-live="polite">
-        <h1 id="answer-question" class="answer-question"></h1>
-        <p id="answer-interpreted" class="answer-interpreted" hidden></p>
-        <p id="answer-verified" class="answer-verified" hidden></p>
-        <p id="answer-summary" class="answer-summary"></p>
-        <p id="answer-insight" class="answer-insight" hidden></p>
-        <p id="answer-message" class="answer-message" hidden></p>
+        <article id="answer" class="card answer" hidden aria-live="polite">
+          <header class="answer-head">
+            <h1 id="answer-question" class="answer-question"></h1>
+            <p id="answer-interpreted" class="answer-interpreted" hidden></p>
+            <p id="answer-verified" class="badge answer-verified" hidden></p>
+          </header>
 
-        <section id="how" class="how" hidden aria-label="How this was answered">
-          <p id="how-explanation" class="how-explanation"></p>
-          <p id="how-corrected" class="how-corrected" hidden></p>
-          <details id="how-details">
-            <summary>SQL that was run</summary>
-            <pre><code id="how-sql"></code></pre>
-            <div id="how-rejected" hidden>
-              <p>Earlier queries that QueryWarden rejected and Claude corrected:</p>
-              <ul id="how-rejected-list"></ul>
+          <p id="answer-summary" class="answer-summary"></p>
+          <p id="answer-insight" class="answer-insight" hidden></p>
+          <p id="answer-message" class="answer-message" hidden></p>
+          <div id="clarify" class="clarify" hidden>
+            <ul id="clarify-options" class="chips" aria-label="Choose what you meant"></ul>
+            <p class="quiet">Or type what you meant in the box above.</p>
+          </div>
+
+          <div id="answer-kpis" class="kpis" hidden></div>
+
+          <div id="chart-controls" class="chart-controls" hidden>
+            <div class="segmented" role="group" aria-label="Show as">
+              <button type="button" data-view="bar" aria-pressed="false">Bar</button>
+              <button type="button" data-view="line" aria-pressed="false">Line</button>
+              <button type="button" data-view="table" aria-pressed="false">Table</button>
             </div>
-          </details>
-        </section>
-
-        <div id="chart-controls" class="chart-controls" hidden>
-          <div class="segmented" role="group" aria-label="Show as">
-            <button type="button" data-view="bar" aria-pressed="false">Bar chart</button>
-            <button type="button" data-view="line" aria-pressed="false">Line chart</button>
-            <button type="button" data-view="table" aria-pressed="false">Table only</button>
+            <label class="plot-pick" id="plot-pick" hidden>Plot
+              <select id="plot-column"></select>
+            </label>
           </div>
-          <label class="plot-pick" id="plot-pick" hidden>Plot
-            <select id="plot-column"></select>
-          </label>
-        </div>
 
-        <figure id="chart-wrap" class="chart" hidden>
-          <canvas id="chart" role="img"></canvas>
-          <figcaption id="chart-caption" class="visually-hidden"></figcaption>
-        </figure>
+          <figure id="chart-wrap" class="chart" hidden>
+            <canvas id="chart" role="img"></canvas>
+            <figcaption id="chart-caption" class="visually-hidden"></figcaption>
+          </figure>
 
-        <div id="table-tools" class="table-tools" hidden>
-          <label class="filter" id="filter-wrap" hidden>
-            <span class="visually-hidden">Filter rows</span>
-            <input id="filter" type="search" placeholder="Filter rows" autocomplete="off">
-          </label>
-          <span id="row-count" class="row-count" aria-live="polite"></span>
-          <button id="download" type="button" class="secondary">Download CSV</button>
-        </div>
-        <div id="table-wrap" class="table-wrap" hidden tabindex="0" aria-label="Result table">
-          <table id="table"></table>
-        </div>
-
-        <ul id="warnings" class="warnings" hidden></ul>
-
-        <div id="feedback" class="feedback" hidden>
-          <span class="feedback-label">Was this answer right?</span>
-          <button id="fb-up" type="button" class="secondary">Correct</button>
-          <button id="fb-down" type="button" class="secondary">Wrong</button>
-          <button id="fb-verify" type="button" class="secondary" hidden>Mark as verified</button>
-          <div id="fb-comment-wrap" class="fb-comment" hidden>
-            <label for="fb-comment">What's wrong? (optional, helps the reviewer)</label>
-            <textarea id="fb-comment" rows="2" maxlength="1000"></textarea>
-            <button id="fb-send" type="button" class="primary">Send</button>
+          <div id="table-tools" class="table-tools" hidden>
+            <label class="filter" id="filter-wrap" hidden>
+              <span class="visually-hidden">Filter rows</span>
+              <input id="filter" type="search" placeholder="Filter rows" autocomplete="off">
+            </label>
+            <span id="row-count" class="row-count" aria-live="polite"></span>
+            <button id="download" type="button" class="secondary small">Download CSV</button>
           </div>
-          <p id="fb-done" class="quiet" role="status" hidden></p>
-        </div>
+          <div id="table-wrap" class="table-wrap" hidden tabindex="0" aria-label="Result table">
+            <table id="table"></table>
+          </div>
 
-        <section id="next" class="next" hidden aria-labelledby="next-heading">
-          <h2 id="next-heading">Ask next</h2>
-          <ul id="next-list"></ul>
+          <ul id="warnings" class="notes" hidden></ul>
+
+          <section id="how" class="how" hidden aria-label="How this was answered">
+            <details id="how-details">
+              <summary>How it was answered</summary>
+              <p id="how-explanation" class="how-explanation"></p>
+              <p id="how-corrected" class="how-corrected" hidden></p>
+              <pre><code id="how-sql"></code></pre>
+              <div id="how-rejected" hidden>
+                <p>Earlier queries that QueryWarden rejected and Claude corrected:</p>
+                <ul id="how-rejected-list"></ul>
+              </div>
+            </details>
+          </section>
+
+          <footer class="answer-actions">
+            <div id="feedback" class="feedback" hidden>
+              <span class="feedback-label">Right answer?</span>
+              <button id="fb-up" type="button" class="secondary small">Correct</button>
+              <button id="fb-down" type="button" class="secondary small">Wrong</button>
+              <button id="fb-verify" type="button" class="secondary small" hidden>Mark as verified</button>
+              <div id="fb-comment-wrap" class="fb-comment" hidden>
+                <label for="fb-comment">What's wrong? (optional, helps the reviewer)</label>
+                <textarea id="fb-comment" rows="2" maxlength="1000"></textarea>
+                <button id="fb-send" type="button" class="primary small">Send</button>
+              </div>
+              <p id="fb-done" class="quiet" role="status" hidden></p>
+            </div>
+
+            <div id="save" class="save" hidden>
+              <button id="save-open" type="button" class="secondary small">Save to dashboard</button>
+              <form id="save-form" class="save-form" hidden>
+                <label for="save-name">Name</label>
+                <input id="save-name" type="text" maxlength="80" autocomplete="off" required>
+                <label for="save-schedule">Run it</label>
+                <select id="save-schedule">
+                  <option value="">When I open the dashboard</option>
+                  <option value="every 15m">Every 15 minutes</option>
+                  <option value="hourly">Every hour</option>
+                  <option value="daily 08:00">Every day at 08:00</option>
+                  <option value="weekdays 08:00">Weekdays at 08:00</option>
+                  <option value="weekly mon 08:00">Mondays at 08:00</option>
+                </select>
+                <div id="save-alert-wrap" class="save-alert">
+                  <label class="check"><input id="save-alert" type="checkbox"> Alert me when</label>
+                  <select id="save-alert-col" aria-label="Column to watch"></select>
+                  <select id="save-alert-op" aria-label="Condition">
+                    <option value="&gt;">is above</option>
+                    <option value="&gt;=">is at least</option>
+                    <option value="&lt;">is below</option>
+                    <option value="&lt;=">is at most</option>
+                    <option value="=">equals</option>
+                    <option value="changes">changes</option>
+                  </select>
+                  <input id="save-alert-value" type="number" step="any" aria-label="Value">
+                </div>
+                <div class="save-actions">
+                  <button type="submit" class="primary small">Save</button>
+                  <button id="save-cancel" type="button" class="secondary small">Cancel</button>
+                </div>
+              </form>
+              <p id="save-done" class="quiet" role="status" hidden></p>
+            </div>
+          </footer>
+
+          <section id="next" class="next" hidden aria-labelledby="next-heading">
+            <h2 id="next-heading">Ask next</h2>
+            <ul id="next-list" class="chips"></ul>
+          </section>
+        </article>
+
+        <section id="earlier" class="earlier" hidden aria-labelledby="earlier-heading">
+          <h2 id="earlier-heading">Earlier in this conversation</h2>
+          <ol id="earlier-list"></ol>
         </section>
-
-      </article>
-
-      <section id="earlier" class="earlier" hidden aria-labelledby="earlier-heading">
-        <h2 id="earlier-heading">Earlier in this conversation</h2>
-        <ol id="earlier-list"></ol>
-      </section>
+      </div>
     </main>
   </div>
 
@@ -137,10 +199,10 @@
     <form id="signin-form" method="dialog">
       <h2 id="signin-heading">Sign in to QueryWarden</h2>
       <p class="quiet">This page is shared. Paste the access token you were given.</p>
-      <label for="signin-token" class="ask-label">Access token</label>
+      <label for="signin-token" class="field-label">Access token</label>
       <input id="signin-token" type="password" autocomplete="off" spellcheck="false" required>
       <p id="signin-error" class="signin-error" role="alert" hidden></p>
-      <div class="ask-row">
+      <div class="dialog-actions">
         <button type="submit" class="primary">Sign in</button>
       </div>
     </form>
@@ -159,13 +221,36 @@
     <div id="review-verified"></div>
   </dialog>
 
+  <dialog id="dashboard" class="settings dashboard" aria-labelledby="dashboard-heading">
+    <div class="settings-head">
+      <h2 id="dashboard-heading">Dashboard</h2>
+      <div class="dash-head-actions">
+        <button id="dashboard-refresh" class="secondary" type="button">Refresh</button>
+        <button id="dashboard-close" class="secondary" type="button">Close</button>
+      </div>
+    </div>
+    <p class="quiet">Saved questions, run again straight from their SQL: no AI call, same safety checks.
+      Scheduled ones also run in the background, and their alerts show up here.</p>
+    <section id="dash-alerts" class="dash-alerts" hidden aria-labelledby="dash-alerts-heading">
+      <h3 id="dash-alerts-heading">Recent alerts</h3>
+      <ul id="dash-alert-list"></ul>
+    </section>
+    <div id="dash-grid" class="dash-grid"></div>
+  </dialog>
+
   <dialog id="settings" class="settings" aria-labelledby="settings-heading">
     <div class="settings-head">
       <h2 id="settings-heading">Settings</h2>
-      <button id="settings-close" class="secondary" type="button">Close</button>
+      <div class="dash-head-actions">
+        <button id="settings-undo" class="secondary" type="button" hidden>Undo last change</button>
+        <button id="settings-edit" class="primary" type="button" hidden>Edit</button>
+        <button id="settings-close" class="secondary" type="button">Close</button>
+      </div>
     </div>
-    <p class="quiet">Read-only. These come from policy.yaml and the server's environment.</p>
+    <p id="settings-intro" class="quiet">These come from policy.yaml and the server's environment.</p>
+    <p id="settings-msg" class="settings-msg" role="status" hidden></p>
     <div id="settings-body"><p class="quiet">Loading…</p></div>
+    <div id="settings-editor" hidden></div>
     <p id="settings-how" class="settings-how"></p>
   </dialog>
 </body>

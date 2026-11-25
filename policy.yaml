@@ -1,10 +1,14 @@
 # QueryWarden policy: what the agent may see and do.
 #
-# Edit this file to point QueryWarden at your own data. No rebuild is needed.
+# This is the policy for the demo `shop` database. For your own database, create one with
+#   java -jar target/querywarden.jar init
+# and edit it, here or on the web page (Settings → Edit, which keeps a backup and these comments).
+# No rebuild or restart is needed: the server picks up changes within 30 seconds.
 # Check the result with:   java -jar target/querywarden.jar policy
 #
 # Names are case-insensitive. Unknown keys are an error, so typos can't silently
-# switch a protection off. Anything left out keeps its built-in default.
+# switch a protection off. allowed_tables is required; anything else left out keeps a
+# neutral default (nothing blocked or masked by name, sharing off, clarifying questions on).
 #
 # This file only controls QueryWarden's own checks and masking. For full protection,
 # the database user that runs the queries must have matching permissions
@@ -39,6 +43,29 @@ blocked_functions: []
 #   examples:
 #     - How many orders are there per status?
 
+
+# Measures defined as exact SQL: SELECT <sql> FROM <from> WHERE <where>. Claude adds grouping and time
+# filters around them but always uses this expression and these conditions. Each one is checked
+# against the rules above when the policy loads, and `doctor` runs it.
+metrics:
+  revenue:
+    description: Money from orders that weren't cancelled ("sales", "income", "turnover").
+    sql: SUM(oi.quantity * oi.unit_price)
+    from: order_items oi JOIN orders o ON o.id = oi.order_id
+    where: o.status <> 'cancelled'
+    time_column: o.order_date
+  units_sold:
+    description: Number of items sold in orders that weren't cancelled.
+    sql: SUM(oi.quantity)
+    from: order_items oi JOIN orders o ON o.id = oi.order_id
+    where: o.status <> 'cancelled'
+    time_column: o.order_date
+  average_order_value:
+    description: Average revenue per order, over orders that weren't cancelled.
+    sql: SUM(oi.quantity * oi.unit_price) / COUNT(DISTINCT o.id)
+    from: order_items oi JOIN orders o ON o.id = oi.order_id
+    where: o.status <> 'cancelled'
+    time_column: o.order_date
 # What your business terms mean. Claude applies these whenever a question uses the term (or an
 # obvious synonym), unless the question explicitly asks for something else. This is how the same
 # question gets the same answer every time. At most 40 terms.
@@ -72,6 +99,10 @@ share_category_values: true
 # The demo data is fake, so it's on here. Think before turning it on for real data.
 share_results_with_ai: true
 
+# Whether Claude may ask "which do you mean?" (with choices) when a question can be read several
+# ways and nothing settles it. false: it answers the most natural reading and says which.
+ask_clarifying_questions: true
+
 limits:
   max_rows: 200             # results are cut to this many rows
   timeout_ms: 3000          # each query is cancelled after this long
@@ -79,3 +110,4 @@ limits:
   max_selects: 6            # SELECT blocks (subqueries, CTEs, UNION parts) in one query
   max_question_chars: 1000  # longest question accepted
   max_sql_chars: 4000       # longest SQL accepted
+  max_tables_in_prompt: 30  # above this many tables, each question is sent only the relevant ones

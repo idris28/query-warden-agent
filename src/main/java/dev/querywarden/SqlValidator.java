@@ -130,6 +130,15 @@ public final class SqlValidator {
             if (!policy.tableAllowed(id) && KNOWN_SENSITIVE.contains(id) && !inspector.cteNames.contains(id))
                 throw new ValidationException("TABLE_NOT_ALLOWED", "Table '" + id + "' is not accessible.");
         }
+        // Second backstop, for any database: whatever follows FROM or JOIN anywhere in the text must be
+        // an allowed table (or a WITH name), even in clauses the AST walk doesn't visit.
+        for (String[] rel : relationsAfterFromOrJoin(sql)) {
+            String schema = rel[0], name = rel[1];
+            if (schema.isEmpty() && inspector.cteNames.contains(name)) continue;
+            if (!schema.isEmpty() && !schema.equals(policy.schema()) || !policy.tableAllowed(name))
+                throw new ValidationException("TABLE_NOT_ALLOWED",
+                        "Table '" + (schema.isEmpty() ? "" : schema + ".") + name + "' is not accessible.");
+        }
 
         if (inspector.joins > policy.maxJoins())
             throw new ValidationException("TOO_COMPLEX", "Query uses " + inspector.joins + " joins (max " + policy.maxJoins() + ").");
@@ -164,7 +173,7 @@ public final class SqlValidator {
 
     /** Relation names that must never appear, even where the AST walk might not look. */
     private static final Set<String> KNOWN_SENSITIVE = Set.of(
-            "api_keys", "pg_authid", "pg_shadow", "pg_user", "pg_roles", "pg_settings", "pg_stat_activity",
+            "pg_authid", "pg_shadow", "pg_user", "pg_roles", "pg_settings", "pg_stat_activity",
             "pg_file_settings", "pg_hba_file_rules", "pg_largeobject", "pg_user_mappings", "information_schema");
 
     private static final java.util.regex.Pattern NOISE = java.util.regex.Pattern.compile(
@@ -185,6 +194,56 @@ public final class SqlValidator {
             out.add(new String[]{Policy.norm(name), call ? "call" : "ref"});
         }
         return out;
+    }
+
+    private static final java.util.regex.Pattern FROM_OR_JOIN = java.util.regex.Pattern.compile(
+            "(?i)\\b(from|join)\\s+(?:only\\s+)?(\"(?:[^\"]|\"\")+\"|[A-Za-z_][A-Za-z0-9_$]*)"
+                    + "(?:\\s*\\.\\s*(\"(?:[^\"]|\"\")+\"|[A-Za-z_][A-Za-z0-9_$]*))?");
+    /** Functions whose arguments use FROM without naming a table: extract(year FROM d), trim(x FROM y), … */
+    private static final Set<String> FROM_INSIDE = Set.of("extract", "substring", "substr", "trim", "overlay", "normalize");
+
+    /** {schema, name} of every relation named right after FROM or JOIN (not function calls or subqueries). */
+    static List<String[]> relationsAfterFromOrJoin(String sql) {
+        String clean = NOISE.matcher(sql).replaceAll(" ");
+        List<String[]> out = new ArrayList<>();
+        var m = FROM_OR_JOIN.matcher(clean);
+        while (m.find()) {
+            String before = clean.substring(0, m.start()).stripTrailing().toLowerCase(java.util.Locale.ROOT);
+            if (before.endsWith("distinct")) continue;                       // IS [NOT] DISTINCT FROM
+            String fn = enclosingFunction(clean, m.start());
+            if (FROM_INSIDE.contains(fn)) continue;
+            int after = m.end();
+            while (after < clean.length() && Character.isWhitespace(clean.charAt(after))) after++;
+            if (after < clean.length() && clean.charAt(after) == '(') continue;  // a function call: checked elsewhere
+            String a = unquote(m.group(2)), b = m.group(3) == null ? null : unquote(m.group(3));
+            if (b == null && a.equals("lateral")) continue;
+            out.add(b == null ? new String[]{"", a} : new String[]{a, b});
+        }
+        return out;
+    }
+
+    private static String unquote(String id) {
+        return id.startsWith("\"") ? id.substring(1, id.length() - 1).replace("\"\"", "\"") : Policy.norm(id);
+    }
+
+    /** The name of the function whose parentheses enclose position {@code pos}, or "". */
+    private static String enclosingFunction(String text, int pos) {
+        int depth = 0;
+        for (int i = pos - 1; i >= 0; i--) {
+            char c = text.charAt(i);
+            if (c == ')') depth++;
+            else if (c == '(') {
+                if (depth == 0) {
+                    int j = i - 1;
+                    while (j >= 0 && Character.isWhitespace(text.charAt(j))) j--;
+                    int end = j + 1;
+                    while (j >= 0 && (Character.isLetterOrDigit(text.charAt(j)) || text.charAt(j) == '_')) j--;
+                    return text.substring(j + 1, end).toLowerCase(java.util.Locale.ROOT);
+                }
+                depth--;
+            }
+        }
+        return "";
     }
 
     private String wrap(String sql, List<String> warnings) {
@@ -243,6 +302,9 @@ public final class SqlValidator {
                     else if (item.getExpression() instanceof AllColumns) stars.add("");
                 }
             }
+            // The base walk skips ORDER BY; a subquery there must be checked like any other.
+            if (ps.getOrderByElements() != null)
+                for (var o : ps.getOrderByElements()) o.getExpression().accept(this, context);
             return super.visit(ps, context);
         }
 
@@ -255,6 +317,8 @@ public final class SqlValidator {
         @Override
         public <S> Void visit(net.sf.jsqlparser.statement.select.SetOperationList list, S context) {
             checkSelect(list);
+            if (list.getOrderByElements() != null)
+                for (var o : list.getOrderByElements()) o.getExpression().accept(this, context);
             return super.visit(list, context);
         }
 

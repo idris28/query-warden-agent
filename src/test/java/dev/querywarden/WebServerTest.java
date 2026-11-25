@@ -44,7 +44,7 @@ class WebServerTest {
     static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:16-alpine")
             .withDatabaseName("shop").withUsername("postgres").withPassword("postgres");
 
-    static final Policy POLICY = Policy.defaults();
+    static final Policy POLICY = Policy.demo();
     static final ObjectMapper JSON = new ObjectMapper();
     static Database.Config cfg;
     static HikariDataSource pool;
@@ -122,6 +122,145 @@ class WebServerTest {
         assertTrue(csp.contains("default-src 'self'") && csp.contains("script-src 'self'"), csp);
         assertEquals("nosniff", r.headers().firstValue("X-Content-Type-Options").orElse(""));
         assertEquals("DENY", r.headers().firstValue("X-Frame-Options").orElse(""));
+    }
+
+    @Test
+    void clarifyingQuestionComesBackWithChoicesAndIsNotAskedAgain() throws Exception {
+        SqlGenerator gen = system -> text -> text.contains("already chosen")
+                ? ok("SELECT category, COUNT(*) AS n FROM products GROUP BY category")
+                : SqlGenerator.Output.clarify("Count products or orders?", List.of("Products", "Orders"));
+        int port = start(gen, new WebServer.Options("127.0.0.1", 0, 4, 100));
+        JsonNode first = JSON.readTree(ask(port, "how big is each category").body());
+        assertEquals("clarify", first.get("status").asText());
+        assertEquals("Count products or orders?", first.get("message").asText());
+        assertEquals(2, first.get("clarify_options").size());
+        assertEquals("Products", first.get("clarify_options").get(0).asText());
+
+        var second = post(port, JSON.writeValueAsString(java.util.Map.of(
+                "question", "how big is each category \u2014 Products", "clarified", true)), "application/json");
+        assertEquals("ok", JSON.readTree(second.body()).get("status").asText(), second.body());
+        assertEquals(400, post(port, "{\"question\":\"x\",\"clarified\":\"yes\"}", "application/json").statusCode(),
+                "clarified must be true or false");
+    }
+
+    @Test
+    void savedQuestionsCanBeSavedRunListedAndRemoved(@TempDir Path dir) throws Exception {
+        var agent = new QueryWardenAgent(cfg, pool, POLICY, byKeyword(), 3, null);
+        var sched = new SavedScheduler(new SavedQuestions(dir.resolve("saved.json")), () -> agent, dir.resolve("alerts.jsonl"),
+                null, java.time.ZoneOffset.UTC);
+        app = new WebServer(agent, POLICY, pool, () -> tables, new WebServer.Options("127.0.0.1", 0, 4, 100))
+                .withSaved(sched).start();
+        int port = app.port();
+        java.util.function.BiFunction<String, Object, HttpResponse<String>> postTo = (path, body) -> {
+            try {
+                return http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body))).build(),
+                        HttpResponse.BodyHandlers.ofString());
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        };
+        assertTrue(JSON.readTree(get(port, "/api/me").body()).get("saved").asBoolean());
+        JsonNode saved = JSON.readTree(postTo.apply("/api/saved", java.util.Map.of("name", "Per status",
+                "question", "orders per status", "sql", "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
+                "schedule", "Daily 8:00", "alert", java.util.Map.of("column", "n", "op", ">", "value", 100))).body());
+        assertEquals("ok", saved.get("status").asText(), saved.toString());
+        assertEquals("daily 08:00", saved.get("schedule").asText());
+
+        JsonNode rejected = JSON.readTree(postTo.apply("/api/saved", java.util.Map.of("question", "pay",
+                "sql", "SELECT salary FROM employees")).body());
+        assertEquals("rejected", rejected.get("status").asText(), "saved SQL gets the same checks");
+        assertEquals(400, postTo.apply("/api/saved", java.util.Map.of("question", "q", "sql", "SELECT 1 FROM orders",
+                "schedule", "every 1m")).statusCode());
+
+        JsonNode list = JSON.readTree(get(port, "/api/saved").body());
+        assertEquals(1, list.get("saved").size());
+        assertEquals("n > 100", list.get("saved").get(0).get("alert").asText());
+        String id = list.get("saved").get(0).get("id").asText();
+
+        JsonNode run = JSON.readTree(postTo.apply("/api/saved/run", java.util.Map.of("id", id)).body());
+        assertEquals("ok", run.get("status").asText());
+        assertEquals(4, run.get("rows").size());
+        assertEquals("ok", JSON.readTree(postTo.apply("/api/saved/remove", java.util.Map.of("id", id)).body()).get("status").asText());
+        assertEquals(404, postTo.apply("/api/saved/run", java.util.Map.of("id", id)).statusCode());
+    }
+
+    @Test
+    void settingsCanBeChangedFromThePageWithAPreviewAConfirmAndUndo(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("policy.yaml");
+        Files.writeString(file, Files.readString(Path.of("policy.yaml")));
+        var agent = new QueryWardenAgent(cfg, pool, POLICY, byKeyword(), 3, null);
+        var applied = new java.util.concurrent.atomic.AtomicInteger();
+        app = new WebServer(agent, POLICY, pool, () -> tables, new WebServer.Options("127.0.0.1", 0, 4, 100))
+                .withEditing(new PolicyEditor(file, dir.resolve(".qw")), null, applied::incrementAndGet).start();
+        int port = app.port();
+        java.util.function.BiFunction<String, Object, JsonNode> postTo = (path, body) -> {
+            try {
+                return JSON.readTree(http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body))).build(),
+                        HttpResponse.BodyHandlers.ofString()).body());
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        };
+        assertTrue(JSON.readTree(get(port, "/api/me").body()).get("can_edit_settings").asBoolean());
+        JsonNode edit = JSON.readTree(get(port, "/api/settings/edit").body());
+        assertTrue(edit.get("editable").toString().contains("allowed_tables"), "everything is editable on this computer");
+        assertTrue(edit.get("tables").toString().contains("api_keys"), "tables that aren't allowed are offered too, by name");
+
+        var add = java.util.Map.of("policy", java.util.Map.of("definitions", java.util.Map.of("vip", "A customer with 5+ orders.")));
+        JsonNode preview = postTo.apply("/api/settings/preview", add);
+        assertEquals("ok", preview.get("status").asText(), preview.toString());
+        assertFalse(Files.readString(file).contains("vip"), "a preview writes nothing");
+        assertEquals("ok", postTo.apply("/api/settings/save", add).get("status").asText());
+        assertTrue(Policy.load(file).definitions().containsKey("vip"));
+        assertEquals(1, applied.get(), "applied at once");
+
+        var open = java.util.Map.of("policy", java.util.Map.of("masked_columns", List.of("email")));
+        JsonNode needsConfirm = postTo.apply("/api/settings/save", open);
+        assertEquals("confirm", needsConfirm.get("status").asText(), "unmasking phone numbers must be confirmed");
+        assertTrue(Policy.load(file).isMasked("phone"));
+        assertEquals("ok", postTo.apply("/api/settings/save", java.util.Map.of("policy", open.get("policy"), "confirm", true))
+                .get("status").asText());
+        assertFalse(Policy.load(file).isMasked("phone"));
+
+        assertEquals("invalid", postTo.apply("/api/settings/preview", java.util.Map.of("policy",
+                java.util.Map.of("allowed_tables", List.of()))).get("status").asText());
+        assertEquals("ok", postTo.apply("/api/settings/undo", java.util.Map.of()).get("status").asText());
+        assertTrue(Policy.load(file).isMasked("phone"), "undo restored the version before the last change");
+    }
+
+    @Test
+    void onASharedPageOnlyReviewersEditAndOnlyTheContentSections(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("policy.yaml");
+        Files.writeString(file, Files.readString(Path.of("policy.yaml")));
+        UserStore users = new UserStore(dir.resolve("users.json"));
+        String reviewer = users.add("rita", true), member = users.add("max", false);
+        var agent = new QueryWardenAgent(cfg, pool, POLICY, byKeyword(), 3, null);
+        app = new WebServer(agent, POLICY, pool, () -> tables, new WebServer.Options("127.0.0.1", 0, 4, 100, users))
+                .withEditing(new PolicyEditor(file, dir.resolve(".qw")), null, () -> { }).start();
+        int port = app.port();
+        java.util.function.BiFunction<String, String, HttpResponse<String>> getAs = (path, token) -> {
+            try {
+                return http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                        .header("Authorization", "Bearer " + token).GET().build(), HttpResponse.BodyHandlers.ofString());
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        };
+        assertEquals(403, getAs.apply("/api/settings/edit", member).statusCode());
+        JsonNode edit = JSON.readTree(getAs.apply("/api/settings/edit", reviewer).body());
+        assertTrue(edit.get("editable").toString().contains("definitions"));
+        assertFalse(edit.get("editable").toString().contains("allowed_tables"), "the data rules stay with the server's owner");
+        assertFalse(edit.get("values").has("blocked_columns"), "and aren't even shown");
+        var widen = http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/settings/save"))
+                .header("Authorization", "Bearer " + reviewer).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"policy\":{\"masked_columns\":[]}}")).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals("invalid", JSON.readTree(widen.body()).get("status").asText(), widen.body());
+        assertTrue(Policy.load(file).isMasked("email"));
     }
 
     @Test
@@ -352,7 +491,7 @@ class WebServerTest {
 
     @Test
     void streamSendsProgressThenResultThenInsights() throws Exception {
-        Policy sharing = Policy.parse("share_results_with_ai: true", "test");
+        Policy sharing = Policy.parse(Policy.demo(), "share_results_with_ai: true", "test");
         FakeAi ai = new FakeAi();
         int port = startWithAi(byKeyword(), sharing, ai);
         List<JsonNode> events = streamEvents(port, "orders per status");
@@ -419,7 +558,7 @@ class WebServerTest {
 
     @Test
     void examplesComeFromThePolicyFirst() throws Exception {
-        Policy withExamples = Policy.parse("examples: [\"Custom question one\"]", "test");
+        Policy withExamples = Policy.parse(Policy.demo(), "examples: [\"Custom question one\"]", "test");
         int port = startWithAi(byKeyword(), withExamples, new FakeAi());
         JsonNode j = JSON.readTree(get(port, "/api/schema").body());
         assertEquals("policy", j.get("examples_source").asText());

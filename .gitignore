@@ -8,6 +8,10 @@ dependency-reduced-pom.xml
 audit.jsonl
 # - "Correct" / "Wrong" feedback
 feedback.jsonl
+# - saved questions (they keep each run's last value, which is real data) and their alerts
+*.saved.json
+saved.json
+alerts.jsonl
 # - access-token fingerprints for the shared page
 users.json
 # - output of `querywarden grants`, holds a password once edited
@@ -15,7 +19,7 @@ grants.sql
 # - secrets
 .env
 .env.*
-# - cache of Claude-written example questions
+# - local state: cached example questions, models chosen on the page, policy backups and change log
 .querywarden/
 
 # Temporary files

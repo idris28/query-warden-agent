@@ -100,8 +100,12 @@
       if (!res.ok) return false;
       const me = await res.json();
       canReview = Boolean(me.reviewer);
+      canEditSettings = Boolean(me.can_edit_settings);
       feedbackOn = Boolean(me.feedback);
       show($("review-open"), canReview && feedbackOn);
+      savedOn = Boolean(me.saved);
+      show($("dashboard-open"), savedOn);
+      if (savedOn) refreshAlertCount();
       if (me.sharing && me.name) {
         $("whoami-name").textContent = me.name;
         show($("whoami"), true);
@@ -132,7 +136,7 @@
 
   function questionButton(q) {
     const b = el("button", { text: q, type: "button" });
-    b.addEventListener("click", () => ask(q));
+    b.addEventListener("click", () => ask(q, { fresh: true }));
     return b;
   }
 
@@ -221,26 +225,34 @@
     return "text";
   }
 
+  // The empty question box shows one of this database's own example questions.
+  let defaultPlaceholder = "Ask a question about your data";
+
   function renderExamples(examples) {
     $("examples").replaceChildren(...examples.map((q) => el("li", {}, [questionButton(q)])));
-    show($("examples-wrap"), examples.length > 0);
+    show($("examples-wrap"), examples.length > 0 && conversation.length === 0);
+    defaultPlaceholder = examples.length ? examples[0] : "Ask a question about your data";
+    if (conversation.length === 0 && !pendingClarify) input.placeholder = defaultPlaceholder;
   }
 
   // ------------------------------------------------------------------ conversation memory and earlier answers
   // Answered questions of this conversation, sent with the next question so follow-ups like
-  // "now only Germany" work. Kept in this page only; "New conversation" or a reload clears it.
+  // "now only for X" work. Kept in this page only; "New conversation" or a reload clears it.
   const conversation = [];
   const EARLIER_MAX = 10;
 
   function updateConversationUi() {
     show($("new-conversation"), conversation.length > 0);
+    // examples are for starting out; once a conversation is going, follow-ups take their place
+    show($("examples-wrap"), conversation.length === 0 && $("examples").children.length > 0);
     input.placeholder = conversation.length > 0
-      ? "Ask a follow-up, e.g. “now only for 2024”, or a new question"
-      : "Which customers spent the most last year?";
+      ? "Ask a follow-up, e.g. “now only last year”, or a new question"
+      : defaultPlaceholder;
   }
 
   $("new-conversation").addEventListener("click", () => {
     conversation.length = 0;
+    pendingClarify = null;
     $("earlier-list").replaceChildren();
     show($("earlier"), false);
     show($("answer"), false);
@@ -268,7 +280,7 @@
       }
     }
     // Controls only work on the current answer; ids must stay unique.
-    for (const sel of [".chart-controls", ".table-tools", "#next", "#progress", "#feedback"]) {
+    for (const sel of [".chart-controls", ".table-tools", "#next", ".answer-actions", "#clarify"]) {
       copy.querySelectorAll(sel).forEach((n) => n.remove());
     }
     copy.removeAttribute("id");
@@ -316,9 +328,19 @@
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); ask(input.value); }
   });
 
-  async function ask(raw) {
-    const question = (raw || "").trim();
+  // Set while a clarifying question is on screen: the next question answers it.
+  let pendingClarify = null;
+
+  async function ask(raw, opts = {}) {
+    let question = (raw || "").trim();
     if (!question || busy) return;
+    let clarified = Boolean(opts.clarified);
+    if (pendingClarify && !clarified && !opts.fresh) {
+      // typed answer to the clarifying question: combine it with the original question
+      question = pendingClarify + " \u2014 " + question;
+      clarified = true;
+    }
+    pendingClarify = null;
     busy = true;
     input.value = question;
     button.disabled = true;
@@ -331,7 +353,7 @@
       const res = await api("/api/ask/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
-        body: JSON.stringify({ question, history: conversation.slice(-3) }),
+        body: JSON.stringify({ question, history: conversation.slice(-3), clarified }),
       });
       const type = res.headers.get("Content-Type") || "";
       if (!res.ok || !type.includes("ndjson")) {
@@ -418,6 +440,11 @@
         (n === 1 ? "1 row" : n + " rows") + (data.truncated ? " (cut off at the row limit)" : "") +
         ", answered in " + (data.elapsed_ms / 1000).toFixed(1) + " seconds";
       show(msg, false);
+    } else if (data.status === "clarify") {
+      $("answer-summary").textContent = "A quick question first";
+      msg.textContent = data.message || "";
+      msg.classList.remove("is-declined");
+      show(msg, true);
     } else {
       $("answer-summary").textContent = data.status === "unanswerable" ? "Not answered"
         : data.status === "blocked" ? "Question blocked" : "Couldn't answer";
@@ -425,6 +452,7 @@
       msg.classList.toggle("is-declined", data.status !== "unanswerable");
       show(msg, true);
     }
+    renderClarify(question, data);
 
     show($("answer-insight"), false);
     show($("next"), false);
@@ -434,14 +462,32 @@
     renderControls();
     renderTable();
     renderChart();
-    renderWarnings(ok ? data.warnings || [] : []);
+    renderKpis(ok ? data : null);
+    // "LIMIT set to N" only matters when rows were actually cut off ("Result truncated to …" says so)
+    renderWarnings(ok ? (data.warnings || []).filter((w) => !/^(LIMIT set to|Query wrapped with LIMIT)/.test(w)) : []);
     renderHow(data);
     renderVerifiedBadge(data);
     renderFeedback(data);
+    renderSave(data);
 
     answer.classList.remove("is-fresh");
     void answer.offsetWidth; // restart the one entrance animation
     answer.classList.add("is-fresh");
+  }
+
+  function renderClarify(question, data) {
+    const options = data.status === "clarify" && Array.isArray(data.clarify_options) ? data.clarify_options : [];
+    $("clarify-options").replaceChildren(...options.map((o) => {
+      const b = el("button", { text: o, type: "button", className: "secondary" });
+      b.addEventListener("click", () => ask(question + " \u2014 " + o, { clarified: true }));
+      return el("li", {}, [b]);
+    }));
+    show($("clarify"), options.length > 0);
+    pendingClarify = options.length > 0 ? question : null;
+    if (pendingClarify) {
+      const first = (data.clarify_options || [])[0];
+      input.placeholder = first ? "Or type what you meant, e.g. \u201c" + first.toLowerCase() + "\u201d" : "Or type what you meant";
+    }
   }
 
   function showInsightPending(text) {
@@ -501,14 +547,28 @@
       el("li", {}, [el("span", { text: a.reason }), el("code", { text: a.sql })])));
     show($("how-rejected"), rejected.length > 0);
     const details = $("how-details");
-    show(details, hasSql || rejected.length > 0);
-    $("how-details").querySelector("summary").textContent = hasSql ? "SQL that was run" : "Rejected queries";
+    show(details, hasSql || rejected.length > 0 || Boolean(data.explanation));
+    $("how-details").querySelector("summary").textContent = hasSql ? "How it was answered, with the SQL" : "How it was answered";
     details.open = sqlOpenPreference();   // re-saving the same value via "toggle" is harmless
   }
 
   // Line breaks before the main clauses so the SQL is readable. Text only; nothing is executed.
   function prettySql(sql) {
     return sql.replace(/\s+(FROM|WHERE|GROUP BY|HAVING|ORDER BY|LIMIT|JOIN|LEFT JOIN|RIGHT JOIN|INNER JOIN|UNION|WITH)\s/g, "\n$1 ");
+  }
+
+  // One row of a few numbers ("total revenue", "orders this month"): show them big instead of a one-line table.
+  function renderKpis(data) {
+    const box = $("answer-kpis");
+    const fits = data && data.rows.length === 1 && data.columns.length <= 4
+      && data.columns.some((c) => isNumberType(c.type));
+    show(box, Boolean(fits));
+    if (!fits) { box.replaceChildren(); return; }
+    const fmt = columnFormatters(data.columns, data.rows);
+    box.replaceChildren(...data.columns.map((c, i) =>
+      el("div", { className: "kpi" }, [el("strong", { text: fmt[i](data.rows[0][i]) }), el("span", { text: c.name })])));
+    show($("table-wrap"), false);
+    show($("filter-wrap"), false);
   }
 
   // ------------------------------------------------------------------ formatting
@@ -691,7 +751,7 @@
     const kind = view.mode;
     const numbers = view.plot === "all" ? shape.numbers.slice(0, 3)
       : shape.numbers.filter((c) => String(c.i) === view.plot);
-    const palette = [cssVar("--teal"), cssVar("--brass"), cssVar("--plum")];
+    const palette = [cssVar("--chart-1"), cssVar("--chart-2"), cssVar("--chart-3")];
     const ink = cssVar("--ink"), muted = cssVar("--muted"), rule = cssVar("--rule");
     let rows = data.rows;
     if (kind === "line" && shape.isTime) {
@@ -779,7 +839,7 @@
   }
 
   function renderFeedback(data) {
-    show($("feedback"), feedbackOn && Boolean(view.question));
+    show($("feedback"), feedbackOn && Boolean(view.question) && data.status !== "clarify");
     for (const id of ["fb-up", "fb-down"]) { $(id).disabled = false; $(id).setAttribute("aria-pressed", "false"); }
     show($("fb-comment-wrap"), false);
     $("fb-comment").value = "";
@@ -921,19 +981,542 @@
     ]);
   }
 
+  // ------------------------------------------------------------------ saved questions and the dashboard
+  let savedOn = false;
+  let dashCharts = [];
+  const SCHEDULE_LABELS = {
+    "every 15m": "every 15 minutes", "every 1h": "every hour", "daily 08:00": "every day at 08:00",
+    "weekdays 08:00": "weekdays at 08:00", "weekly mon 08:00": "Mondays at 08:00",
+  };
+  const scheduleLabel = (s) => SCHEDULE_LABELS[s] || s;
+
+  function renderSave(data) {
+    show($("save"), savedOn && data.status === "ok" && Boolean(data.sql) && Boolean(view.question));
+    show($("save-open"), true);
+    show($("save-form"), false);
+    show($("save-done"), false);
+  }
+
+  function saveMessage(text) {
+    $("save-done").textContent = text;
+    show($("save-done"), true);
+  }
+
+  $("save-open").addEventListener("click", () => {
+    const d = view.data;
+    $("save-name").value = (d.interpreted_question || view.question).slice(0, 80);
+    const nums = d.columns.filter((c) => c.type === "number");
+    $("save-alert-col").replaceChildren(...nums.map((c) => {
+      const o = el("option", { text: c.name });
+      o.value = c.name;
+      return o;
+    }));
+    show($("save-alert-wrap"), nums.length > 0);
+    $("save-alert").checked = false;
+    $("save-alert-value").value = "";
+    show($("save-open"), false);
+    show($("save-done"), false);
+    show($("save-form"), true);
+    $("save-name").focus();
+  });
+  $("save-cancel").addEventListener("click", () => { show($("save-form"), false); show($("save-open"), true); });
+  $("save-alert-op").addEventListener("change", () => show($("save-alert-value"), $("save-alert-op").value !== "changes"));
+
+  $("save-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const d = view.data;
+    const schedule = $("save-schedule").value;
+    let alert = null;
+    if ($("save-alert").checked) {
+      const op = $("save-alert-op").value;
+      const raw = $("save-alert-value").value;
+      if (!schedule) { saveMessage("Alerts are checked on scheduled runs: choose when it should run."); return; }
+      if (op !== "changes" && raw === "") { saveMessage("Enter the number to compare with."); return; }
+      alert = { column: $("save-alert-col").value, op, value: op === "changes" ? null : Number(raw) };
+    }
+    const r = await postJson("/api/saved", { name: $("save-name").value, question: d.interpreted_question || view.question,
+      sql: d.sql, schedule, alert });
+    if (r.ok) {
+      show($("save-form"), false);
+      saveMessage("Saved to the dashboard" + (schedule ? "; it runs " + scheduleLabel(r.data.schedule) + "." : "."));
+      refreshAlertCount();
+    } else {
+      saveMessage(r.data.message || "Couldn't save it.");
+    }
+  });
+
+  async function fetchSaved() {
+    const res = await api("/api/saved", { headers: { Accept: "application/json" } });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.message || "failed");
+    return j;
+  }
+
+  async function refreshAlertCount(list) {
+    try {
+      const saved = list || (await fetchSaved()).saved;
+      const n = saved.filter((s) => s.alerting).length;
+      renderRailSaved(saved);
+      $("alert-count").textContent = String(n);
+      $("alert-count").title = n + (n === 1 ? " saved question is" : " saved questions are") + " alerting";
+      show($("alert-count"), n > 0);
+    } catch { /* ignore */ }
+  }
+  setInterval(() => { if (savedOn) refreshAlertCount(); }, 120000);
+
+  // Saved questions in the side rail: click one to ask it again.
+  function renderRailSaved(saved) {
+    $("rail-saved").replaceChildren(...saved.slice(0, 12).map((s) => {
+      const b = el("button", { text: s.name, type: "button", className: s.alerting ? "is-alerting" : "" });
+      b.title = s.alerting && s.last_message ? "Alert: " + s.last_message : s.question;
+      b.addEventListener("click", () => ask(s.question, { fresh: true }));
+      return el("li", {}, [b]);
+    }));
+    show($("rail-saved-block"), saved.length > 0);
+  }
+
+  const dashboard = $("dashboard");
+  $("dashboard-open").addEventListener("click", () => { dashboard.showModal(); loadDashboard(); });
+  $("dashboard-close").addEventListener("click", () => dashboard.close());
+  $("dashboard-refresh").addEventListener("click", () => loadDashboard());
+  dashboard.addEventListener("close", () => { dashCharts.forEach((c) => c.destroy()); dashCharts = []; });
+
+  async function loadDashboard() {
+    dashCharts.forEach((c) => c.destroy());
+    dashCharts = [];
+    const grid = $("dash-grid");
+    grid.replaceChildren(el("p", { className: "quiet", text: "Loading…" }));
+    let j;
+    try {
+      j = await fetchSaved();
+    } catch {
+      grid.replaceChildren(el("p", { className: "quiet", text: "Couldn't load the saved questions." }));
+      return;
+    }
+    refreshAlertCount(j.saved);
+    const alerts = j.alerts || [];
+    $("dash-alert-list").replaceChildren(...alerts.slice(0, 8).map((a) => {
+      const t = el("time", { text: new Date(a.at).toLocaleString() });
+      t.dateTime = a.at;
+      return el("li", {}, [t, document.createTextNode(a.message)]);
+    }));
+    show($("dash-alerts"), alerts.length > 0);
+    if (!j.saved.length) {
+      grid.replaceChildren(el("p", { className: "quiet",
+        text: "Nothing saved yet. Ask a question, then choose \u201cSave to dashboard\u201d under the answer." }));
+      return;
+    }
+    const cards = j.saved.map(dashCard);
+    grid.replaceChildren(...cards.map((c) => c.node));
+    for (const c of cards) await runCard(c);   // one at a time: gentle on the database
+  }
+
+  function dashCard(s) {
+    const body = el("div", { className: "dash-body" }, [el("p", { className: "quiet", text: "Running…" })]);
+    const meta = [];
+    meta.push(s.schedule ? "Runs " + scheduleLabel(s.schedule) : "Runs when you open the dashboard");
+    if (s.alert) meta.push("alert when " + s.alert);
+    const children = [el("h3", { text: s.name }), el("p", { className: "dash-meta", text: meta.join(", ") })];
+    if (s.alerting && s.last_message) children.push(el("p", { className: "dash-alert-msg", text: "Alert: " + s.last_message }));
+    if (s.last_status === "failed" && s.last_message)
+      children.push(el("p", { className: "dash-alert-msg", text: "Last scheduled run failed: " + s.last_message }));
+    children.push(body);
+    const again = el("button", { text: "Ask again", type: "button", className: "secondary" });
+    again.title = s.question;
+    again.addEventListener("click", () => { dashboard.close(); ask(s.question, { fresh: true }); });
+    const actions = [again];
+    if (s.can_remove) {
+      const rm = el("button", { text: "Remove", type: "button", className: "secondary" });
+      rm.addEventListener("click", async () => {
+        if (!confirm("Remove \u201c" + s.name + "\u201d from the dashboard?")) return;
+        const r = await postJson("/api/saved/remove", { id: s.id });
+        if (r.ok) loadDashboard(); else alert(r.data.message || "Couldn't remove it.");
+      });
+      actions.push(rm);
+    }
+    children.push(el("div", { className: "dash-actions" }, actions));
+    const node = el("article", { className: "dash-card" + (s.alerting ? " is-alerting" : "") }, children);
+    return { s, node, body };
+  }
+
+  async function runCard(c) {
+    let data;
+    try {
+      const res = await api("/api/saved/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ id: c.s.id }),
+      });
+      data = await res.json();
+    } catch {
+      data = { status: "failed", message: "Couldn't run it." };
+    }
+    if (data.status !== "ok") {
+      c.body.replaceChildren(el("p", { className: "dash-alert-msg", text: data.message || "Couldn't run it." }));
+      return;
+    }
+    c.body.replaceChildren(dashResult(data));
+  }
+
+  function dashResult(data) {
+    const fmt = columnFormatters(data.columns, data.rows);
+    if (data.rows.length === 0) return el("p", { className: "quiet", text: "No rows." });
+    // one row of numbers: show them big
+    if (data.rows.length === 1 && data.columns.length <= 4) {
+      return el("div", { className: "dash-big" }, data.columns.map((c, i) =>
+        el("div", {}, [el("strong", { text: fmt[i](data.rows[0][i]) }), el("span", { text: c.name })])));
+    }
+    const shape = analyse(data);
+    if (shape && typeof window.Chart === "function" && (shape.isTime || data.rows.length <= 15)) {
+      const canvas = el("canvas");
+      const figure = el("figure", { className: "dash-figure" }, [canvas]);
+      const num = shape.numbers[0];
+      let rows = data.rows;
+      if (shape.isTime) rows = [...rows].sort((a, b) => String(a[shape.label.i]).localeCompare(String(b[shape.label.i])));
+      const colour = cssVar("--chart-1"), muted = cssVar("--muted"), rule = cssVar("--rule"), ink = cssVar("--ink");
+      canvas.setAttribute("role", "img");
+      canvas.setAttribute("aria-label", (shape.isTime ? "Line" : "Bar") + " chart of " + num.name + " by " + shape.label.name);
+      requestAnimationFrame(() => {
+        dashCharts.push(new window.Chart(canvas, {
+          type: shape.isTime ? "line" : "bar",
+          data: {
+            labels: rows.map((r) => fmt[shape.label.i](r[shape.label.i])),
+            datasets: [{ label: num.name, data: rows.map((r) => (typeof r[num.i] === "number" ? r[num.i] : null)),
+              backgroundColor: colour, borderColor: colour, borderWidth: shape.isTime ? 2 : 0, pointRadius: 0,
+              tension: 0.2, maxBarThickness: 28 }],
+          },
+          options: {
+            maintainAspectRatio: false,
+            animation: false,
+            plugins: { legend: { display: false },
+              tooltip: { callbacks: { label: (ctx) => num.name + ": " + formatNumber(ctx.parsed.y) } } },
+            scales: {
+              x: { grid: { display: false }, ticks: { color: ink, autoSkip: true, maxRotation: 0 }, border: { color: rule } },
+              y: { grid: { color: rule }, ticks: { color: muted }, border: { display: false }, beginAtZero: true },
+            },
+          },
+        }));
+      });
+      return figure;
+    }
+    const shown = data.rows.slice(0, 6);
+    const head = el("tr", {}, data.columns.map((c) => el("th", { text: c.name })));
+    const body = shown.map((r) => el("tr", {}, r.map((v, i) =>
+      el("td", { text: fmt[i](v), className: data.columns[i].type === "number" ? "num" : "" }))));
+    const table = el("table", { className: "dash-table" }, [el("thead", {}, [head]), el("tbody", {}, body)]);
+    if (data.rows.length <= shown.length) return table;
+    return el("div", {}, [table, el("p", { className: "quiet", text: (data.rows.length - shown.length) + " more rows" })]);
+  }
+
+  // ------------------------------------------------------------------ colour theme (auto follows the system)
+  const THEME_KEY = "querywarden.theme";
+  const THEMES = ["auto", "light", "dark"];
+  function applyTheme(t) {
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+    else delete document.documentElement.dataset.theme;
+    $("theme-toggle").textContent = "Theme: " + t;
+    if (view.data && view.data.status === "ok") renderChart();
+  }
+  let theme = "auto";
+  try { theme = THEMES.includes(localStorage.getItem(THEME_KEY)) ? localStorage.getItem(THEME_KEY) : "auto"; } catch { /* ignore */ }
+  applyTheme(theme);
+  $("theme-toggle").addEventListener("click", () => {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    try { localStorage.setItem(THEME_KEY, theme); } catch { /* ignore */ }
+    applyTheme(theme);
+  });
+
   // ------------------------------------------------------------------ read-only settings
   const settingsDialog = $("settings");
-  $("settings-open").addEventListener("click", async () => {
-    settingsDialog.showModal();
+  $("settings-open").addEventListener("click", () => { settingsDialog.showModal(); showSettings(); });
+
+  async function showSettings(message) {
+    show($("settings-editor"), false);
+    show($("settings-body"), true);
+    show($("settings-edit"), canEditSettings);
+    show($("settings-msg"), Boolean(message));
+    $("settings-msg").textContent = message || "";
+    $("settings-intro").textContent = canEditSettings
+      ? "These come from policy.yaml and the server's environment. Choose Edit to change them."
+      : "Read-only. These come from policy.yaml and the server's environment.";
     try {
       const res = await api("/api/settings", { headers: { Accept: "application/json" } });
       if (!res.ok) throw new Error();
-      renderSettings(await res.json());
+      const info = await res.json();
+      renderSettings(info);
+      show($("settings-undo"), Boolean(info.undo_available));
     } catch {
       $("settings-body").replaceChildren(el("p", { className: "quiet", text: "Couldn't load the settings." }));
     }
-  });
+  }
   $("settings-close").addEventListener("click", () => settingsDialog.close());
+
+  // ------------------------------------------------------------------ editing settings
+  let canEditSettings = false;
+  let editState = null;   // what /api/settings/edit returned
+
+  $("settings-edit").addEventListener("click", openEditor);
+  $("settings-undo").addEventListener("click", async () => {
+    if (!confirm("Go back to the version of the policy before the last change?")) return;
+    const r = await postJson("/api/settings/undo", {});
+    showSettings(r.ok ? "Undone: " + (r.data.changes.map((c) => c.text).join("; ") || "no differences") + "."
+      : (r.data.message || "Couldn't undo."));
+  });
+
+  async function openEditor() {
+    let e;
+    try {
+      const res = await api("/api/settings/edit", { headers: { Accept: "application/json" } });
+      e = await res.json();
+      if (!res.ok) throw new Error(e.message);
+    } catch (err) {
+      showSettings(err.message || "Couldn't load the settings for editing.");
+      return;
+    }
+    editState = e;
+    show($("settings-body"), false);
+    show($("settings-edit"), false);
+    show($("settings-msg"), false);
+    $("settings-intro").textContent = "Changes are checked like a hand-edited " + e.file + ", saved with a backup, and apply within seconds.";
+    const box = $("settings-editor");
+    box.replaceChildren(...buildEditor(e));
+    show(box, true);
+  }
+
+  // small form helpers (all values are set as properties, never as HTML)
+  function field(labelText, input, hint) {
+    const id = "f" + Math.random().toString(36).slice(2, 9);
+    input.id = id;
+    const label = el("label", { text: labelText });
+    label.htmlFor = id;
+    return el("div", { className: "edit-field" }, hint ? [label, input, el("p", { className: "quiet", text: hint })] : [label, input]);
+  }
+  function textInput(value, cls) { const i = el("input", { type: "text", className: cls || "" }); i.value = value || ""; return i; }
+  function numberInput(value) { const i = el("input", { type: "number" }); i.value = value; i.min = "0"; i.step = "1"; return i; }
+  function checkbox(labelText, checked, cls) {
+    const c = el("input", { type: "checkbox" });
+    c.checked = Boolean(checked);
+    const l = el("label", { className: "check " + (cls || "") }, [c, document.createTextNode(" " + labelText)]);
+    return { node: l, input: c };
+  }
+  function section(title, hint, children) {
+    return el("section", { className: "edit-section" },
+      [el("h3", { text: title }), ...(hint ? [el("p", { className: "quiet", text: hint })] : []), ...children]);
+  }
+  const csv = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
+
+  // Builds the form; each section registers how to read its value back.
+  let readers = {};
+  function buildEditor(e) {
+    readers = {};
+    const v = e.values, out = [];
+    const can = (k) => e.editable.includes(k);
+
+    if (can("definitions")) {
+      const rows = el("div", { className: "edit-rows" });
+      const addRow = (term, meaning) => {
+        const t = textInput(term), m = el("textarea", { className: "" });
+        m.rows = 2;
+        m.value = meaning || "";
+        t.placeholder = "term";
+        m.placeholder = "what it means, e.g. which rows count";
+        const rm = el("button", { text: "Remove", type: "button", className: "secondary small" });
+        const row = el("div", { className: "edit-row def-row" }, [t, m, rm]);
+        rm.addEventListener("click", () => row.remove());
+        rows.append(row);
+      };
+      Object.entries(v.definitions).forEach(([t, m]) => addRow(t, m));
+      const add = el("button", { text: "Add a term", type: "button", className: "secondary small" });
+      add.addEventListener("click", () => addRow("", ""));
+      readers.definitions = () => Object.fromEntries([...rows.querySelectorAll(".def-row")]
+        .map((r) => [r.querySelector("input").value.trim(), r.querySelector("textarea").value.trim()]).filter(([t]) => t));
+      out.push(section("Business definitions", "What your terms mean. Claude applies them whenever a question uses the term.", [rows, add]));
+    }
+
+    if (can("metrics")) {
+      const rows = el("div", { className: "edit-rows" });
+      const addMetric = (name, m) => {
+        m = m || {};
+        const inputs = {
+          name: textInput(name, "mono"), description: textInput(m.description), sql: textInput(m.sql, "mono"),
+          from: textInput(m.from, "mono"), where: textInput(m.where, "mono"), time_column: textInput(m.time_column, "mono"),
+        };
+        inputs.name.placeholder = "name_like_this";
+        inputs.sql.placeholder = "SUM(t.amount)";
+        inputs.from.placeholder = "table t JOIN other o ON o.id = t.other_id";
+        inputs.where.placeholder = "optional condition";
+        inputs.time_column.placeholder = "optional, e.g. t.created_at";
+        const rm = el("button", { text: "Remove metric", type: "button", className: "secondary small" });
+        const box = el("fieldset", { className: "edit-metric" }, [
+          field("Name", inputs.name), field("Description", inputs.description), field("Expression", inputs.sql),
+          field("From", inputs.from), field("Where", inputs.where), field("Time column", inputs.time_column), rm]);
+        box.metricInputs = inputs;
+        rm.addEventListener("click", () => box.remove());
+        rows.append(box);
+      };
+      Object.entries(v.metrics).forEach(([n, m]) => addMetric(n, m));
+      const add = el("button", { text: "Add a metric", type: "button", className: "secondary small" });
+      add.addEventListener("click", () => addMetric("", {}));
+      readers.metrics = () => Object.fromEntries([...rows.querySelectorAll(".edit-metric")].map((b) => {
+        const i = b.metricInputs;
+        return [i.name.value.trim(), { description: i.description.value, sql: i.sql.value, from: i.from.value,
+          where: i.where.value, time_column: i.time_column.value }];
+      }).filter(([n]) => n));
+      out.push(section("Metrics", "Measures as exact SQL: SELECT expression FROM … WHERE …. Checked against the rules when you save.", [rows, add]));
+    }
+
+    if (can("examples")) {
+      const t = el("textarea");
+      t.rows = 4;
+      t.value = v.examples.join("\n");
+      t.placeholder = "Leave empty and Claude writes them from your tables";
+      readers.examples = () => t.value.split("\n").map((x) => x.trim()).filter(Boolean);
+      out.push(section("Example questions", "One per line, shown under the question box.", [t]));
+    }
+
+    const behaviour = [];
+    if (can("ask_clarifying_questions")) {
+      const c = checkbox("Ask a clarifying question when a question can be read several ways", v.ask_clarifying_questions);
+      readers.ask_clarifying_questions = () => c.input.checked;
+      behaviour.push(c.node);
+    }
+    if (can("share_results_with_ai")) {
+      const c = checkbox("Share up to 50 masked result rows with Claude, for one-line summaries", v.share_results_with_ai, "is-risky");
+      readers.share_results_with_ai = () => c.input.checked;
+      behaviour.push(c.node);
+    }
+    if (can("share_category_values")) {
+      const c = checkbox("Share the values of short category columns (statuses, country codes) with Claude", v.share_category_values, "is-risky");
+      readers.share_category_values = () => c.input.checked;
+      behaviour.push(c.node);
+    }
+    if (behaviour.length) out.push(section("Answers and sharing", "", behaviour));
+
+    if (can("limits")) {
+      const labels = { max_rows: "Rows per answer", timeout_ms: "Time per query (ms)", max_joins: "Joins per query",
+        max_selects: "SELECT blocks per query", max_question_chars: "Question length", max_sql_chars: "SQL length",
+        max_tables_in_prompt: "Tables sent with each question" };
+      const inputs = {};
+      const grid = el("div", { className: "edit-grid" }, Object.entries(labels).map(([k, l]) => {
+        inputs[k] = numberInput(v.limits[k]);
+        return field(l, inputs[k]);
+      }));
+      readers.limits = () => Object.fromEntries(Object.entries(inputs).map(([k, i]) => [k, Number(i.value)]));
+      out.push(section("Limits", "", [grid]));
+    }
+
+    if (can("allowed_tables")) {
+      const schema = textInput(v.schema, "mono");
+      readers.schema = () => schema.value.trim();
+      const allowed = new Set(v.allowed_tables), blocked = v.blocked_columns || {};
+      const list = el("div", { className: "edit-tables" });
+      const tables = e.tables || [];
+      const names = new Set(tables.map((t) => t.name));
+      for (const t of v.allowed_tables) if (!names.has(t)) tables.push({ name: t, columns: [] });   // listed but not found
+      for (const t of tables) {
+        const on = checkbox(t.name, allowed.has(t.name), "mono");
+        on.input.dataset.table = t.name;
+        const cols = el("div", { className: "edit-cols" }, t.columns.map((c) => {
+          const b = checkbox(c, (blocked[t.name] || []).includes(c), "mono");
+          b.input.dataset.table = t.name;
+          b.input.dataset.column = c;
+          b.input.className = "block-col";
+          return b.node;
+        }));
+        const det = el("details", {}, [el("summary", { text: "Blocked columns" + ((blocked[t.name] || []).length ? " (" + blocked[t.name].length + ")" : "") }), cols]);
+        list.append(el("div", { className: "edit-table" }, [on.node, t.columns.length ? det : el("span", { className: "quiet", text: "not found in this schema" })]));
+      }
+      readers.allowed_tables = () => [...list.querySelectorAll("input[data-table]:not(.block-col)")].filter((i) => i.checked).map((i) => i.dataset.table);
+      readers.blocked_columns = () => {
+        const out2 = {};
+        for (const i of list.querySelectorAll("input.block-col")) if (i.checked) (out2[i.dataset.table] = out2[i.dataset.table] || []).push(i.dataset.column);
+        return out2;
+      };
+      const masked = textInput(v.masked_columns.join(", "), "mono");
+      readers.masked_columns = () => csv(masked.value);
+      const funcs = textInput(v.blocked_functions.join(", "), "mono");
+      readers.blocked_functions = () => csv(funcs.value);
+      out.push(section("Data access", "Which tables Claude may use, and which columns are never read. The database user's permissions must match: run `querywarden grants` after changing them.", [
+        field("Schema", schema), list,
+        field("Hidden in results (column names, comma-separated)", masked),
+        field("Extra blocked functions (comma-separated)", funcs, "The built-in list of dangerous PostgreSQL functions always applies."),
+      ]));
+    }
+
+    if (e.models_editable) {
+      const m = e.models;
+      const pick = (value, choices) => {
+        const s = el("select");
+        const all = choices.includes(value) ? choices : [value, ...choices];
+        s.replaceChildren(...all.map((c) => { const o = el("option", { text: c }); o.value = c; return o; }));
+        s.value = value;
+        return s;
+      };
+      const sm = pick(m.sql_model, e.model_choices), se = pick(m.sql_effort, e.efforts);
+      const hm = pick(m.helper_model, e.model_choices), he = pick(m.helper_effort, e.efforts);
+      readers.__models = () => ({ sql_model: sm.value, sql_effort: se.value, helper_model: hm.value, helper_effort: he.value });
+      out.push(section("Models", "Saved in .querywarden/models.json and used straight away. Check accuracy with `querywarden eval` after changing the SQL model.", [
+        el("div", { className: "edit-grid" }, [field("Writes the SQL", sm), field("Effort", se), field("Examples, summaries, follow-ups", hm), field("Effort", he)]),
+      ]));
+    }
+
+    const review = el("div", { id: "settings-review", className: "edit-review" });
+    review.hidden = true;
+    const reviewBtn = el("button", { text: "Review changes", type: "button", className: "primary" });
+    const cancel = el("button", { text: "Cancel", type: "button", className: "secondary" });
+    reviewBtn.addEventListener("click", async () => {
+      reviewBtn.disabled = true;
+      try { await submitSettings(false, review); } finally { reviewBtn.disabled = false; }
+    });
+    cancel.addEventListener("click", () => showSettings());
+    out.push(review, el("div", { className: "dialog-actions" }, [reviewBtn, cancel]));
+    return out;
+  }
+
+  function collectSettings() {
+    const policy = {};
+    for (const [k, read] of Object.entries(readers)) if (!k.startsWith("__")) policy[k] = read();
+    const body = { policy };
+    if (readers.__models) body.models = readers.__models();
+    return body;
+  }
+
+  async function submitSettings(save, review, confirmed) {
+    const body = collectSettings();
+    if (save) body.confirm = Boolean(confirmed);
+    const r = await postJson(save ? "/api/settings/save" : "/api/settings/preview", body);
+    const d = r.data;
+    if (save && d.status === "ok") {
+      const n = d.changes.length;
+      showSettings("Saved " + n + (n === 1 ? " change" : " changes") + (d.backup ? " (backup: " + d.backup + ")" : "")
+        + ". It applies within seconds." + (d.grants_note ? " " + d.grants_note : ""));
+      return;
+    }
+    show(review, true);
+    if (d.status === "invalid" || (!r.ok && d.status !== "confirm" && d.status !== "unchanged")) {
+      review.replaceChildren(el("p", { className: "edit-error", text: d.message || "Couldn't check these settings." }));
+      return;
+    }
+    if (d.status === "unchanged") { review.replaceChildren(el("p", { className: "quiet", text: "Nothing has changed." })); return; }
+    const items = d.changes.map((c) => el("li", { className: c.widens ? "is-widening" : "", text: c.text }));
+    const parts = [el("h3", { text: "These changes will be saved" }), el("ul", {}, items)];
+    let confirmBox = null;
+    if (d.needs_confirm) {
+      confirmBox = checkbox("I understand: the changes marked in red let more data be seen or leave this computer", false);
+      parts.push(confirmBox.node);
+    }
+    if (d.grants_note) parts.push(el("p", { className: "quiet", text: d.grants_note }));
+    const saveBtn = el("button", { text: "Save changes", type: "button", className: "primary" });
+    saveBtn.addEventListener("click", () => {
+      if (confirmBox && !confirmBox.input.checked) { confirmBox.node.classList.add("needs-attention"); return; }
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving and applying…";   // the server rebuilds its setup before answering
+      submitSettings(true, review, confirmBox ? confirmBox.input.checked : false);
+    });
+    parts.push(el("div", { className: "dialog-actions" }, [saveBtn]));
+    review.replaceChildren(...parts);
+    review.scrollIntoView({ block: "nearest" });
+  }
   settingsDialog.addEventListener("click", (e) => { if (e.target === settingsDialog) settingsDialog.close(); });
 
   function renderSettings(s) {
@@ -959,6 +1542,7 @@
         ["Limits", "up to " + lim.max_rows + " rows, " + lim.timeout_ms / 1000 + " s per query, " +
           lim.max_joins + " joins, " + lim.max_selects + " SELECT blocks"],
         ["Question length", "up to " + lim.max_question_chars + " characters"],
+        ["Tables sent with each question", p.tables_per_question || "all"],
       ]),
       el("h3", { text: "AI" }),
       rows([
@@ -969,6 +1553,8 @@
         ["Category values shared with AI", p.share_category_values ? "Yes: short category lists such as country codes"
           : "No", p.share_category_values ? "is-on" : ""],
         ["Example questions from", exampleSource],
+        ["Clarifying questions", p.ask_clarifying_questions === false ? "Off: Claude picks the most natural reading"
+          : "On: Claude asks when a question has several readings"],
       ]),
       el("h3", { text: "Live updates" }),
       rows([
@@ -978,10 +1564,14 @@
         ...(s.live && s.live.last_error ? [["Problem", s.live.last_error, "is-on"]] : []),
         ["Refusal fallback", m.refusal_fallback_sql ? "on for SQL writing" : "off"],
       ]),
+      el("h3", { text: "Metrics" }),
+      Object.keys(p.metrics || {}).length
+        ? rows(Object.entries(p.metrics).map(([name, m]) => [name, m.description + "  " + m.sql]))
+        : el("p", { className: "quiet", text: "None. Add a metrics section to policy.yaml to define measures as exact SQL." }),
       el("h3", { text: "Business definitions" }),
       Object.keys(p.definitions || {}).length
         ? rows(Object.entries(p.definitions).map(([term, meaning]) => [term, meaning]))
-        : el("p", { className: "quiet", text: "None. Add a definitions section to policy.yaml so terms like revenue always mean the same thing." }),
+        : el("p", { className: "quiet", text: "None. Add a definitions section to policy.yaml so your business terms always mean the same thing." }),
       el("h3", { text: "Web page" }),
       rows([
         ["Address", w.address + (w.local_only ? " (this computer only)"

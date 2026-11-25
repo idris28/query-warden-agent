@@ -11,7 +11,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 /** Static guardrails only: no database, no LLM. */
 class SqlValidatorTest {
 
-    private final Policy policy = Policy.defaults();
+    private final Policy policy = Policy.demo();
     private final SqlValidator validator = new SqlValidator(policy);
 
     @ParameterizedTest(name = "{1}: {0}")
@@ -49,6 +49,10 @@ class SqlValidatorTest {
             "SELECT pg_catalog.pg_sleep(1) FROM customers | FUNCTION_NOT_ALLOWED",
             "SELECT name FROM customers ORDER BY pg_sleep(10) | FUNCTION_NOT_ALLOWED",
             "SELECT name FROM customers ORDER BY (SELECT max(secret) FROM api_keys) | TABLE_NOT_ALLOWED",
+            // the same for any table name: nothing about a particular database is built in
+            "SELECT name FROM customers ORDER BY (SELECT max(note) FROM internal_notes) | TABLE_NOT_ALLOWED",
+            "SELECT name FROM customers WHERE id = ANY(ARRAY(SELECT id FROM payroll)) | TABLE_NOT_ALLOWED",
+            "SELECT name FROM customers c JOIN other_schema.customers x ON x.id = c.id | TABLE_NOT_ALLOWED",
             "SELECT department FROM employees GROUP BY department HAVING max(salary) > 1 | COLUMN_NOT_ALLOWED",
             "SELECT department FROM employees ORDER BY \"salary\" | COLUMN_NOT_ALLOWED",
             "SELECT 1 | NO_TABLES",
@@ -58,6 +62,14 @@ class SqlValidatorTest {
         SqlValidator.ValidationException e = assertThrows(SqlValidator.ValidationException.class,
                 () -> validator.validate(sql));
         assertEquals(code, e.code(), e.getMessage());
+    }
+
+    @Test
+    void fromInsideFunctionsIsNotMistakenForATable() throws Exception {
+        validator.validate("SELECT extract(year FROM order_date) AS y, COUNT(*) FROM orders GROUP BY 1");
+        validator.validate("SELECT trim(both ' ' FROM name), substring(name FROM 1 FOR 3) FROM customers");
+        validator.validate("SELECT id FROM orders WHERE status IS DISTINCT FROM 'cancelled'");
+        validator.validate("SELECT name FROM customers ORDER BY (SELECT COUNT(*) FROM orders o WHERE o.customer_id = customers.id) DESC");
     }
 
     @Test

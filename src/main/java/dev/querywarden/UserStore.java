@@ -40,7 +40,7 @@ public final class UserStore {
 
     private final Path file;
     private List<User> users = List.of();
-    private long loadedModified = -1;
+    private String loadedModified = "";
 
     public UserStore(Path file) {
         this.file = file;
@@ -116,11 +116,11 @@ public final class UserStore {
     private void reloadIfChanged() throws IOException {
         if (!Files.exists(file)) {
             users = List.of();
-            loadedModified = -1;
+            loadedModified = "";
             return;
         }
-        long modified = Files.getLastModifiedTime(file).toMillis() ^ Files.size(file);
-        if (modified == loadedModified) return;
+        String modified = stamp(file);
+        if (modified.equals(loadedModified)) return;
         JsonNode root = JSON.readTree(file.toFile());
         List<User> out = new ArrayList<>();
         for (JsonNode u : root.path("users")) {
@@ -150,7 +150,13 @@ public final class UserStore {
         }
         Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         users = List.copyOf(next);
-        loadedModified = Files.getLastModifiedTime(file).toMillis() ^ Files.size(file);
+        loadedModified = stamp(file);
+    }
+
+    /** Identifies one version of a file: modified time, size and file identity (a new file after each atomic save). */
+    static String stamp(Path f) throws java.io.IOException {
+        var a = Files.readAttributes(f, java.nio.file.attribute.BasicFileAttributes.class);
+        return a.lastModifiedTime().toMillis() + ":" + a.size() + ":" + a.fileKey();
     }
 
     static String sha256(String s) {

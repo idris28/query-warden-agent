@@ -26,11 +26,11 @@ import java.util.Random;
  */
 public final class Database {
 
-    /** Connection settings, read from environment variables with local-dev defaults. */
+    /** Connection settings, from environment variables. QW_DB_URL is required; the users have local-dev defaults. */
     public record Config(String url, String adminUser, String adminPassword, String agentUser, String agentPassword) {
         public static Config fromEnv() {
             return new Config(
-                    env("QW_DB_URL", "jdbc:postgresql://localhost:5432/shop"),
+                    required("QW_DB_URL", "the database to use, e.g. jdbc:postgresql://localhost:5432/your_db"),
                     env("QW_ADMIN_USER", "postgres"),
                     env("QW_ADMIN_PASSWORD", "postgres"),
                     env("QW_AGENT_USER", "qw_agent"),
@@ -69,6 +69,12 @@ public final class Database {
             hc.setConnectionTimeout(5_000);
             hc.setPoolName("querywarden-agent");
             return new com.zaxxer.hikari.HikariDataSource(hc);
+        }
+
+        private static String required(String key, String what) {
+            String v = System.getenv(key);
+            if (v == null || v.isBlank()) throw new IllegalStateException("Set " + key + ": " + what + ".");
+            return v;
         }
 
         private static String env(String key, String def) {

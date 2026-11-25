@@ -1,0 +1,10 @@
+{
+  "variant" : "v3",
+  "sql_model" : "claude-sonnet-5-5",
+  "sql_effort" : "medium",
+  "reps" : 2,
+  "cases" : 65,
+  "started" : "2026-11-25T21:40:07.742999Z",
+  "wall_clock_s" : 83.39,
+  "finished" : "2026-11-25T21:41:31.356467Z"
+}

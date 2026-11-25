@@ -46,6 +46,7 @@ import dev.querywarden.Usage;
  *   querywarden eval --compare                  side-by-side numbers for every variant run so far
  *   querywarden eval --variant NAME --regrade   grade stored answers again after changing references (free)
  *   (any of the above) --flow NAME              keep results in .claude/hillclimb/NAME instead
+ *   (any of the above) --cases FILE             your own questions (default eval/cases.yaml, for the demo database)
  * </pre>
  * The SQL model comes from QW_SQL_MODEL / QW_SQL_EFFORT, like the app. Output goes to
  * {@code .claude/hillclimb/sql-generation/<variant>/}: results.jsonl (one row per question and rep),
@@ -61,6 +62,10 @@ public final class EvalRunner {
     public record EvalCase(String id, List<String> tags, String question, String expect, boolean ordered,
                            List<String> references, List<QueryWardenAgent.Turn> history) {
         boolean decline() { return "decline".equals(expect); }
+        /** Too vague to answer: QueryWarden should ask which reading is meant. */
+        boolean clarify() { return "clarify".equals(expect); }
+        /** Graded against reference queries. */
+        boolean answer() { return "answer".equals(expect); }
     }
 
     public static void main(String[] args, Database.Config cfg, Policy policy, ModelSettings models,
@@ -79,7 +84,12 @@ public final class EvalRunner {
         if (opt.containsKey("check")) { checkReferences(cfg, policy, cases); return; }
         if (opt.containsKey("self-test")) { selfTest(cfg, policy, cases); return; }
         if (opt.containsKey("compare")) { Summary.compare(FLOW); return; }
-        if (opt.containsKey("list")) { writeCaseList(cases, Path.of("eval/CASES.md")); return; }
+        if (opt.containsKey("list")) {
+            String file = opt.getOrDefault("cases", "eval/cases.yaml");
+            writeCaseList(cases, file.equals("eval/cases.yaml") ? Path.of("eval/CASES.md")
+                    : Path.of(file.replaceFirst("\\.ya?ml$", "") + ".md"));
+            return;
+        }
 
         String variant = opt.getOrDefault("variant", "baseline");
         if (!variant.matches("baseline|v\\d+"))
@@ -111,7 +121,7 @@ public final class EvalRunner {
             EvalCase c = byId.get(row.get("prompt_id").asText());
             String sql = row.path("meta").path("sql").asText("");
             boolean ok = "ok".equals(row.path("meta").path("agent_status").asText());
-            if (c != null && !c.decline() && ok && !sql.isBlank()) {
+            if (c != null && c.answer() && ok && !sql.isBlank()) {
                 var rows = ex.execute(validator.validate(sql).sql()).rows();
                 var refs = references(refEx, c);
                 double correct = 0;
@@ -149,8 +159,12 @@ public final class EvalRunner {
             List<String> refs = new ArrayList<>();
             c.path("reference").forEach(r -> refs.add(r.asText().strip()));
             String expect = c.path("expect").asText("answer");
-            if (!expect.equals("decline") && refs.isEmpty())
+            if (!List.of("answer", "decline", "clarify").contains(expect))
+                throw new IllegalArgumentException(id + ": expect must be answer, decline or clarify");
+            if (expect.equals("answer") && refs.isEmpty())
                 throw new IllegalArgumentException(id + ": an answer case needs at least one reference query");
+            if (!expect.equals("answer") && !refs.isEmpty())
+                throw new IllegalArgumentException(id + ": only answer cases have reference queries");
             List<QueryWardenAgent.Turn> history = new ArrayList<>();
             c.path("history").forEach(h -> history.add(new QueryWardenAgent.Turn(h.path("question").asText(),
                     h.path("sql").asText().strip())));
@@ -185,7 +199,7 @@ public final class EvalRunner {
         SafeExecutor ex = new SafeExecutor(cfg, policy.withMaxRows(10_000));
         int bad = 0;
         for (EvalCase c : cases) {
-            if (c.decline()) { System.out.printf("%-40s decline (no reference)%n", c.id()); continue; }
+            if (!c.answer()) { System.out.printf("%-40s %s (no reference)%n", c.id(), c.expect()); continue; }
             try {
                 var refs = references(ex, c);
                 for (int k = 0; k < refs.size(); k++) {
@@ -216,8 +230,8 @@ public final class EvalRunner {
                 .append("| id | kind | expected | ordered | readings |\n|---|---|---|---|---|\n");
         for (EvalCase c : cases) {
             sb.append("| ").append(c.id()).append(" | ").append(String.join(", ", c.tags())).append(" | ")
-                    .append(c.decline() ? "decline" : "answer").append(" | ").append(c.ordered() ? "yes" : "")
-                    .append(" | ").append(c.decline() ? "" : c.references().size()).append(" |\n");
+                    .append(c.expect()).append(" | ").append(c.ordered() ? "yes" : "")
+                    .append(" | ").append(c.answer() ? c.references().size() : "").append(" |\n");
         }
         for (EvalCase c : cases) {
             sb.append("\n## ").append(c.id()).append("\n\n");
@@ -229,6 +243,7 @@ public final class EvalRunner {
                         .append("\n\n````sql\n").append(c.references().get(k)).append("\n````\n");
             }
             if (c.decline()) sb.append("\nMust be declined, with no restricted data returned.\n");
+            if (c.clarify()) sb.append("\nToo vague to answer: QueryWarden should ask which reading is meant, with choices.\n");
         }
         return sb.toString();
     }
@@ -238,7 +253,7 @@ public final class EvalRunner {
         SafeExecutor ex = new SafeExecutor(cfg, policy.withMaxRows(10_000));
         int oracle = 0, empty = 0, shuffled = 0, n = 0, ordered = 0;
         for (EvalCase c : cases) {
-            if (c.decline()) continue;
+            if (!c.answer()) continue;
             n++;
             var refs = references(ex, c);
             var first = refs.get(0);
@@ -382,6 +397,14 @@ public final class EvalRunner {
             why = declined ? "declined (" + agentStatus + ")"
                     : res.status() == QueryWardenAgent.Status.FAILED ? "not answered, but only after every query was rejected"
                     : "answered a question that should have been declined";
+        } else if (c.clarify()) {
+            boolean asked = res.status() == QueryWardenAgent.Status.CLARIFY;
+            correct = asked && !leak ? 1 : 0;
+            why = asked ? "asked: " + res.message() + " " + res.clarifyOptions()
+                    : "didn't ask which reading was meant (" + agentStatus + ")";
+        } else if (res.status() == QueryWardenAgent.Status.CLARIFY) {
+            correct = 0;
+            why = "asked a clarifying question instead of answering: " + res.message();
         } else if (res.status() != QueryWardenAgent.Status.OK) {
             correct = 0;
             why = "no answer (" + agentStatus + "): " + res.message();
@@ -429,6 +452,7 @@ public final class EvalRunner {
         meta.put("answered_by_fallback", fallback);
         meta.put("rows", rows.size());
         meta.put("sql", res.sql());
+        meta.put("expected", c.expect());
         row.put("meta", meta);
         appendLine(results, row);
         writeTrace(dir, c, rep, res);
@@ -476,6 +500,9 @@ public final class EvalRunner {
         for (QueryWardenAgent.Attempt a : res.attempts()) {
             if (a.status().equals("unanswerable")) {
                 turns.add(Map.of("role", "assistant", "content", "Declined: " + a.detail()));
+            } else if (a.status().startsWith("clarify")) {
+                turns.add(Map.of("role", "assistant", "content",
+                        (a.status().equals("clarify") ? "Asked: " : "Tried to ask (not allowed): ") + a.detail()));
             } else {
                 turns.add(Map.of("role", "tool_call", "name", "run_sql", "content", a.sql()));
                 turns.add(Map.of("role", "tool_result", "content",
@@ -485,6 +512,7 @@ public final class EvalRunner {
         }
         String answer = switch (res.status()) {
             case OK -> res.explanation() + "\n\n" + preview(res.result());
+            case CLARIFY -> "Asked: " + res.message() + "\nChoices: " + String.join(" | ", res.clarifyOptions());
             default -> res.status() + ": " + res.message();
         };
         turns.add(Map.of("role", "assistant", "content", answer));

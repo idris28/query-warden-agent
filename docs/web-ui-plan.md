@@ -1,3 +1,9 @@
+> **Historical document.** This is the original plan for the first web page (2026-11-25), kept as a
+> record of the decisions made then. The page has changed a lot since: a new design, saved questions
+> and the Dashboard, verified answers and feedback, clarifying questions, sharing with colleagues and
+> editable settings. For the current page, endpoints and protections see
+> [README.md → Web page](../README.md#web-page).
+
 # Plan: QueryWarden web page
 
 Status: built and tested (2026-11-25). Done since: examples from policy.yaml or Claude, live progress,

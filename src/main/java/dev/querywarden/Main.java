@@ -10,17 +10,21 @@ import java.util.List;
 /**
  * QueryWarden CLI.
  * <pre>
- *   querywarden setup                      create schema, sample data and the least-privilege agent role
- *   querywarden ask "top 5 customers by revenue"
- *   querywarden repl                       interactive mode
+ *   querywarden init                       write a first policy.yaml from any PostgreSQL database
+ *   querywarden setup                      demo only: create the sample schema, data and the read-only agent role
+ *   querywarden ask "how many rows does each table have?"
+ *   querywarden repl                       interactive mode ('save [schedule]' saves the last answer)
  *   querywarden check "SELECT ..."         run guardrails + execution on raw SQL (no LLM)
  *   querywarden schema                     print the schema the model sees
  *   querywarden policy                     print the policy in effect
  *   querywarden grants                     print the SQL for the read-only database user (never runs it)
  *   querywarden doctor                     check the database user's real permissions against the policy
  *   querywarden serve [--port N]           web page on http://localhost:8080 (this computer only)
+ *   querywarden serve --share              share the page with colleagues (sign-in required)
+ *   querywarden users | verified | saved | feedback   people, verified answers, saved questions, feedback
+ *   querywarden eval ...                   measure accuracy (see EvalRunner)
  * </pre>
- * Options: --policy FILE (default: $QW_POLICY, then ./policy.yaml, then built-in defaults),
+ * Options: --policy FILE (default: $QW_POLICY, then ./policy.yaml; `init` writes one from the database),
  *          --no-fallbacks (disable server-side refusal fallbacks)
  */
 public final class Main {
@@ -40,17 +44,35 @@ public final class Main {
         }
         String cmd = args.isEmpty() ? "help" : args.remove(0);
         String rest = String.join(" ", args);
-        if (!List.of("setup", "schema", "check", "ask", "repl", "policy", "serve", "eval", "grants", "doctor", "users", "verified", "feedback").contains(cmd)) {
+        if (!List.of("init", "setup", "schema", "check", "ask", "repl", "policy", "serve", "eval", "grants", "doctor", "users", "verified", "feedback", "saved").contains(cmd)) {
             System.out.println(USAGE);
             return;
         }
 
-        Database.Config cfg = Database.Config.fromEnv();
+        Database.Config cfg;
+        try {
+            cfg = Database.Config.fromEnv();
+        } catch (IllegalStateException e) {
+            System.err.println(e.getMessage());
+            System.exit(4);
+            return;
+        }
+        if (cmd.equals("init")) {
+            System.exit(init(cfg, args));
+            return;
+        }
         Policy policy;
         String policySource;
         Path policyFile;
         try {
-            Policy.Loaded loaded = Policy.resolve(policyPath);
+            Policy.Loaded loaded;
+            if (cmd.equals("setup") && policyPath == null && System.getenv("QW_POLICY") == null
+                    && !java.nio.file.Files.isRegularFile(Path.of(Policy.DEFAULT_FILE))) {
+                // the demo needs no policy file: it creates the sample `shop` database
+                loaded = new Policy.Loaded(Policy.demo(), "the demo policy (no policy.yaml)", null);
+            } else {
+                loaded = Policy.resolve(policyPath);
+            }
             policy = loaded.policy();
             policySource = loaded.source();
             policyFile = loaded.path();
@@ -119,13 +141,17 @@ public final class Main {
                             + "network you trust, or put an HTTPS proxy (for example Caddy) in front.");
                 }
                 com.zaxxer.hikari.HikariDataSource pool = cfg.agentPool(opts.maxInFlight() + 1);
-                AiHelper ai = new ClaudeAiHelper(models, fallbacks);
+                // models chosen on the Settings panel (kept in .querywarden/models.json) win over QW_* variables
+                ModelSwitch modelSwitch = new ModelSwitch(Path.of(".querywarden", "models.json"), models,
+                        m -> new ClaudeSqlGenerator(m, fallbacks), m -> new ClaudeAiHelper(m, fallbacks));
+                models = modelSwitch.current();
+                AiHelper ai = modelSwitch;
                 System.out.println("Models: SQL " + models.sqlModel() + " (" + models.sqlEffort() + " effort), helper "
                         + models.helperModel() + " (" + models.helperEffort() + " effort)");
                 if (policy.examples().isEmpty())
                     System.out.println("Example questions: written by Claude from the tables (cached in .querywarden/)…");
                 // Policy file and database are re-checked every 30 s; changes apply without a restart.
-                LiveRuntime live = new LiveRuntime(cfg, pool, policyPath, new ClaudeSqlGenerator(models, fallbacks), ai,
+                LiveRuntime live = new LiveRuntime(cfg, pool, policyPath, modelSwitch, ai,
                         Path.of("audit.jsonl"), Path.of(".querywarden", "examples.json"));
                 WebServer.Examples examples = live.get().examples();
                 System.out.println("Example questions: " + examples.questions().size() + " (from " + examples.source() + ")");
@@ -133,11 +159,17 @@ public final class Main {
                         ? "on (up to 50 masked result rows are sent to Claude per answer)"
                         : "off (results stay on this computer; Claude only suggests follow-ups)"));
                 live.start(30);
+                SavedScheduler scheduler = SavedScheduler.fromEnv(SavedQuestions.forPolicy(policyFile), () -> live.get().agent()).start();
+                System.out.println("Saved questions: " + scheduler.store().list().size() + " in " + scheduler.store().file().getFileName()
+                        + " (scheduled ones run without Claude; alerts " + (scheduler.webhookConfigured()
+                                ? "also go to QW_ALERT_WEBHOOK" : "show on the page and in alerts.jsonl") + ").");
                 System.out.println("Live reload: on (policy.yaml and the database are checked every 30 seconds).");
                 new WebServer(live, pool, ai, opts)
                         .withInfo(policySource, models, fallbacks)
                         .withLive(live::status, live::refreshExamples)
                         .withFeedback(FeedbackStore.fromEnv())
+                        .withSaved(scheduler)
+                        .withEditing(new PolicyEditor(policyFile, Path.of(".querywarden")), modelSwitch, live::check)
                         .start();
                 System.out.println(opts.sharing()
                         ? "QueryWarden is running on " + opts.host() + ":" + opts.port()
@@ -194,7 +226,46 @@ public final class Main {
                         if (list.isEmpty()) System.out.println("Nobody yet. Add someone with: querywarden users add NAME");
                         list.forEach(u -> System.out.println(u.name() + (u.reviewer() ? "   (reviewer)" : "") + "   added " + u.created()));
                     }
-                    default -> { System.err.println("usage: querywarden users [list | add NAME | remove NAME]"); System.exit(2); }
+                    default -> { System.err.println("usage: querywarden users [list | add NAME [--reviewer] | remove NAME]"); System.exit(2); }
+                }
+            }
+            case "saved" -> {
+                SavedQuestions store = SavedQuestions.forPolicy(policyFile);
+                String[] parts = rest.isBlank() ? new String[0] : rest.trim().split("\\s+");
+                String sub = parts.length == 0 ? "list" : parts[0];
+                switch (sub) {
+                    case "list" -> {
+                        var list = store.list();
+                        System.out.println(list.size() + " saved question(s) in " + store.file());
+                        for (var x : list) {
+                            System.out.println();
+                            System.out.println(x.id() + "  " + x.name() + (x.schedule().isEmpty() ? "" : "   [" + x.schedule() + "]")
+                                    + (x.alert() == null ? "" : "   alert when " + x.alert().describe())
+                                    + (x.alerting() ? "   ALERTING" : ""));
+                            if (!x.lastRun().isEmpty())
+                                System.out.println("    last run " + x.lastRun() + ": " + x.lastStatus() + ", value " + x.lastValue());
+                            System.out.println("    " + x.sql().replaceAll("\\s+", " "));
+                        }
+                    }
+                    case "run" -> {
+                        if (parts.length != 2) { System.err.println("usage: querywarden saved run ID"); System.exit(2); }
+                        var x = store.get(parts[1]);
+                        if (x.isEmpty()) { System.err.println("No saved question " + parts[1] + "."); System.exit(1); }
+                        QueryWardenAgent.Result r = agent(cfg, policy, fallbacks).runSaved(x.get().question(), x.get().sql(), "cli");
+                        print(r);
+                        System.exit(r.status() == QueryWardenAgent.Status.OK ? 0 : 1);
+                    }
+                    case "run-due" -> {
+                        // For cron, when the web server isn't running: runs what's due and raises alerts.
+                        QueryWardenAgent a = agent(cfg, policy, fallbacks);
+                        int n = SavedScheduler.fromEnv(store, () -> a).tick(java.time.Instant.now());
+                        System.out.println("Ran " + n + " due saved question(s).");
+                    }
+                    case "remove" -> {
+                        if (parts.length != 2) { System.err.println("usage: querywarden saved remove ID"); System.exit(2); }
+                        System.out.println(store.remove(parts[1]) ? "Removed " + parts[1] + "." : "No saved question " + parts[1] + ".");
+                    }
+                    default -> { System.err.println("usage: querywarden saved [list | run ID | run-due | remove ID]"); System.exit(2); }
                 }
             }
             case "verified" -> {
@@ -257,10 +328,13 @@ public final class Main {
             }
             case "repl" -> {
                 QueryWardenAgent agent = agent(cfg, policy, fallbacks).withVerified(VerifiedAnswers.forPolicy(policyFile));
-                System.out.println("Ask a question about the database. Follow-ups like \"now only Germany\" use the "
-                        + "earlier answers; type 'new' to start over. Ctrl-D to exit.");
+                System.out.println("Ask a question about the database. Follow-ups like \"now only last year\" use the "
+                        + "earlier answers; type 'new' to start over, 'save [schedule]' to save the last answer "
+                        + "(e.g. save daily 08:00). Ctrl-D to exit.");
                 BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
                 List<QueryWardenAgent.Turn> history = new ArrayList<>();
+                QueryWardenAgent.Result pending = null;   // a clarifying question waiting for an answer
+                QueryWardenAgent.Result lastOk = null;
                 while (true) {
                     System.out.print("\n> ");
                     String line = in.readLine();
@@ -269,33 +343,116 @@ public final class Main {
                     if (line.isEmpty()) continue;
                     if (line.equalsIgnoreCase("new")) {
                         history.clear();
+                        pending = null;
                         System.out.println("Started a new conversation.");
                         continue;
                     }
-                    QueryWardenAgent.Result r = agent.ask(line, "cli", p -> { }, history);
+                    if (pending == null && (line.equalsIgnoreCase("save") || line.toLowerCase(java.util.Locale.ROOT).startsWith("save "))) {
+                        if (lastOk == null) { System.out.println("Ask a question first; 'save' saves the last answer."); continue; }
+                        try {
+                            String q = lastOk.interpretedQuestion().isBlank() ? lastOk.question() : lastOk.interpretedQuestion();
+                            var x = SavedQuestions.forPolicy(policyFile).add(q, q, lastOk.sql(), "cli", line.substring(4).strip(), null);
+                            System.out.println("Saved as " + x.id() + (x.schedule().isEmpty() ? "" : ", runs " + x.schedule())
+                                    + ". The web page's Dashboard shows it; 'querywarden saved list' lists it.");
+                        } catch (IllegalArgumentException e) {
+                            System.out.println(e.getMessage());
+                        }
+                        continue;
+                    }
+                    boolean clarified = false;
+                    if (pending != null) {
+                        // answer to the clarifying question: a choice number or your own words
+                        String choice = line;
+                        if (line.matches("\\d+")) {
+                            int k = Integer.parseInt(line) - 1;
+                            if (k >= 0 && k < pending.clarifyOptions().size()) choice = pending.clarifyOptions().get(k);
+                        }
+                        line = pending.question() + " \u2014 " + choice;
+                        clarified = true;
+                        pending = null;
+                    }
+                    QueryWardenAgent.Result r = agent.ask(line, "cli", p -> { }, history, !clarified);
                     print(r);
-                    if (r.status() == QueryWardenAgent.Status.OK) history.add(new QueryWardenAgent.Turn(line, r.sql()));
+                    if (r.status() == QueryWardenAgent.Status.CLARIFY) pending = r;
+                    if (r.status() == QueryWardenAgent.Status.OK) {
+                        history.add(new QueryWardenAgent.Turn(line, r.sql()));
+                        lastOk = r;
+                    }
                 }
             }
             default -> System.out.println(USAGE);
         }
     }
 
+    /** `init [--schema NAME] [--output FILE] [--force]`: writes a first policy from the database. */
+    static int init(Database.Config cfg, List<String> args) throws Exception {
+        String schema = null, output = Policy.DEFAULT_FILE;
+        boolean force = false;
+        for (int k = 0; k < args.size(); k++) {
+            switch (args.get(k)) {
+                case "--schema" -> schema = k + 1 < args.size() ? args.get(++k) : null;
+                case "--output" -> output = k + 1 < args.size() ? args.get(++k) : null;
+                case "--force" -> force = true;
+                default -> { System.err.println("usage: querywarden init [--schema NAME] [--output FILE] [--force]"); return 2; }
+            }
+        }
+        if (output == null || (args.contains("--schema") && schema == null)) {
+            System.err.println("usage: querywarden init [--schema NAME] [--output FILE] [--force]");
+            return 2;
+        }
+        java.sql.Connection conn;
+        try {
+            conn = cfg.admin();
+        } catch (java.sql.SQLException adminFailed) {
+            conn = cfg.agent();   // reading the table list needs no special rights
+        }
+        PolicyInit.Draft d;
+        try (java.sql.Connection c = conn) {
+            if (schema == null) schema = PolicyInit.guessSchema(c);
+            d = PolicyInit.draft(c, schema);
+        }
+        String label = "schema '" + schema + "' of " + cfg.url().replaceAll("^jdbc:postgresql://", "").replaceAll("\\?.*$", "");
+        String yaml = PolicyInit.toYaml(d, label);
+        Path out = Path.of(output);
+        if (java.nio.file.Files.exists(out) && !force) {
+            System.out.print(yaml);
+            System.err.println("\n" + out + " already exists, so the draft was printed instead of saved. "
+                    + "Use --output FILE to save it elsewhere, or --force to replace it.");
+            return 3;
+        }
+        java.nio.file.Files.writeString(out, yaml);
+        System.out.println("Wrote " + out + ": " + PolicyInit.summary(d) + ".");
+        System.out.println("Review it, then run `querywarden grants` for the database user's permissions and "
+                + "`querywarden doctor` to check them.");
+        try {
+            Policy.load(out);
+        } catch (Policy.PolicyException e) {
+            System.err.println("Note: " + e.getMessage());
+        }
+        return 0;
+    }
+
     private static final String USAGE = """
-            usage: querywarden <setup|schema|policy|ask|repl|check|serve> [text] [--policy FILE] [--no-fallbacks]
+            usage: querywarden <init|setup|schema|policy|ask|repl|check|serve> [text] [--policy FILE] [--no-fallbacks]
+                   querywarden init [--schema NAME] [--output FILE] [--force]   write a first policy.yaml from your database
                    querywarden serve [--port N]    web page at http://localhost:8080 (this computer only)
                    querywarden serve --share [--host ADDRESS] [--port N]   share with colleagues (sign-in required)
                    querywarden users [list | add NAME [--reviewer] | remove NAME]   people who may sign in
                    querywarden verified [list | remove ID | to-eval]          checked question-and-SQL pairs
+                   querywarden saved [list | run ID | run-due | remove ID]   saved questions, schedules and alerts
                    querywarden feedback [--all]                               "Correct"/"Wrong" feedback to review
-                   querywarden eval --check | --self-test | --variant NAME [--reps N] | --compare
+                   querywarden eval --check | --self-test | --list | --compare | --variant NAME [--reps N] [--regrade]
+                         [--cases FILE] [--only id1,id2] [--flow NAME]   measure accuracy
                    querywarden grants              SQL for the read-only database user (review, then run)
                    querywarden doctor              check the database user's real permissions against the policy
-            env:   QW_DB_URL, QW_ADMIN_USER, QW_ADMIN_PASSWORD, QW_AGENT_USER, QW_AGENT_PASSWORD,
-                   QW_POLICY, ANTHROPIC_API_KEY""";
+            env:   QW_DB_URL (required), ANTHROPIC_API_KEY, QW_ADMIN_USER, QW_ADMIN_PASSWORD, QW_AGENT_USER,
+                   QW_AGENT_PASSWORD, QW_POLICY, QW_SQL_MODEL, QW_SQL_EFFORT, QW_HELPER_MODEL, QW_HELPER_EFFORT,
+                   QW_USERS_FILE, QW_FEEDBACK_FILE, QW_ALERT_WEBHOOK""";
 
     private static QueryWardenAgent agent(Database.Config cfg, Policy policy, boolean fallbacks) throws Exception {
-        return new QueryWardenAgent(cfg, policy, new ClaudeSqlGenerator(ModelSettings.fromEnv(), fallbacks), 3,
+        // the same models as the web page: choices saved on its Settings panel win over the QW_* variables
+        ModelSettings models = ModelSwitch.withSaved(ModelSettings.fromEnv(), Path.of(".querywarden", "models.json"));
+        return new QueryWardenAgent(cfg, policy, new ClaudeSqlGenerator(models, fallbacks), 3,
                 Path.of("audit.jsonl"));
     }
 
@@ -317,6 +474,13 @@ public final class Main {
         for (QueryWardenAgent.Attempt a : r.attempts()) {
             if (!a.status().equals("ok")) System.out.println("  attempt " + i + ": " + a.status() + " " + a.detail());
             i++;
+        }
+        if (r.status() == QueryWardenAgent.Status.CLARIFY) {
+            System.out.println("A quick question first: " + r.message());
+            for (int k = 0; k < r.clarifyOptions().size(); k++)
+                System.out.println("  " + (k + 1) + ". " + r.clarifyOptions().get(k));
+            System.out.println("Type a number, or say what you meant.");
+            return;
         }
         if (r.status() != QueryWardenAgent.Status.OK) {
             System.out.println("[" + r.status() + "] " + r.message());

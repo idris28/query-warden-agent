@@ -35,8 +35,11 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
                     "sql", Map.of("type", "string"),
                     "explanation", Map.of("type", "string"),
                     "reason", Map.of("type", "string"),
-                    "interpreted_question", Map.of("type", "string")),
-            "required", List.of("answerable", "sql", "explanation", "reason", "interpreted_question"),
+                    "interpreted_question", Map.of("type", "string"),
+                    "clarifying_question", Map.of("type", "string"),
+                    "options", Map.of("type", "array", "items", Map.of("type", "string"))),
+            "required", List.of("answerable", "sql", "explanation", "reason", "interpreted_question",
+                    "clarifying_question", "options"),
             "additionalProperties", false);
 
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -115,9 +118,16 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
                             "no text block in response", null));
             try {
                 JsonNode n = JSON.readTree(text);
+                List<String> options = new java.util.ArrayList<>();
+                n.path("options").forEach(o -> {
+                    String t = o.asText("").strip();
+                    if (!t.isEmpty() && t.length() <= 120 && options.size() < 4 && !options.contains(t)) options.add(t);
+                });
+                String clarify = n.path("clarifying_question").asText("").strip();
+                if (clarify.length() > 300) clarify = clarify.substring(0, 300);
                 return new Output(n.path("answerable").asBoolean(false), n.path("sql").asText(""),
                         n.path("explanation").asText(""), n.path("reason").asText(""), usage,
-                        n.path("interpreted_question").asText(""));
+                        n.path("interpreted_question").asText(""), clarify, options);
             } catch (Exception e) {
                 throw new GeneratorException("The AI returned an answer that couldn't be read. Please try again.",
                         "invalid JSON from model: " + e.getMessage(), e);

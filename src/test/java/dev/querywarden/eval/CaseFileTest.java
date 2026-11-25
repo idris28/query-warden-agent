@@ -19,8 +19,8 @@ class CaseFileTest {
         for (var c : cases) {
             assertFalse(c.question().isBlank(), c.id() + " has no question");
             assertFalse(c.tags().isEmpty(), c.id() + " has no tag");
-            if (!c.decline()) assertFalse(c.references().isEmpty(), c.id() + " has no reference SQL");
-            else assertTrue(c.references().isEmpty(), c.id() + ": decline questions have no reference");
+            if (c.answer()) assertFalse(c.references().isEmpty(), c.id() + " has no reference SQL");
+            else assertTrue(c.references().isEmpty(), c.id() + ": decline and clarify questions have no reference");
         }
     }
 

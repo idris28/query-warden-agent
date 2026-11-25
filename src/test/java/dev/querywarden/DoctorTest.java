@@ -22,7 +22,7 @@ class DoctorTest {
     static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:16-alpine")
             .withDatabaseName("shop").withUsername("postgres").withPassword("postgres");
 
-    static final Policy POLICY = Policy.defaults();
+    static final Policy POLICY = Policy.demo();
     static Database.Config cfg;
 
     @BeforeAll
@@ -97,7 +97,7 @@ class DoctorTest {
 
     @Test
     void grantsWarnAboutPolicyTypos() throws Exception {
-        Policy typo = Policy.parse("""
+        Policy typo = Policy.parse(Policy.demo(), """
                 allowed_tables: [customers, invoices]
                 blocked_columns: {customers: [emial]}
                 masked_columns: [phnoe]

@@ -18,7 +18,7 @@ final class Summary {
     record Stats(String variant, String model, String effort, int n, double correct, double lo, double hi,
                  int leaks, int errors, double callsPerCase, int rejected, long medianTokens, long minTokens,
                  long maxTokens, double costPerCase, double totalCost, double medianLatency, double p90Latency,
-                 double wallClock, Map<String, double[]> byTag, int fallbacks) {}
+                 double wallClock, Map<String, double[]> byTag, int fallbacks, int overAsked) {}
 
     static Stats stats(Path dir) throws IOException {
         List<JsonNode> rows = readJsonl(dir.resolve("results.jsonl"));
@@ -26,7 +26,7 @@ final class Summary {
         JsonNode run = Files.exists(dir.resolve("run.json")) ? EvalRunner.JSON.readTree(dir.resolve("run.json").toFile()) : null;
         int n = rows.size();
         double correct = 0, calls = 0, cost = 0;
-        int leaks = 0, rejected = 0, fallbacks = 0;
+        int leaks = 0, rejected = 0, fallbacks = 0, overAsked = 0;
         List<Long> tokens = new ArrayList<>();
         List<Double> latency = new ArrayList<>();
         Map<String, double[]> byTag = new TreeMap<>();   // tag -> {correct, n}
@@ -37,6 +37,8 @@ final class Summary {
             calls += r.path("meta").path("claude_calls").asDouble();
             rejected += r.path("meta").path("rejected_queries").asInt();
             if (r.path("meta").path("answered_by_fallback").asBoolean(false)) fallbacks++;
+            if ("clarify".equals(r.path("meta").path("agent_status").asText())
+                    && !"clarify".equals(r.path("meta").path("expected").asText("answer"))) overAsked++;
             cost += r.path("meta").path("cost_usd").asDouble();
             JsonNode u = r.path("usage");
             tokens.add(u.path("input_tokens").asLong() + u.path("output_tokens").asLong()
@@ -59,7 +61,7 @@ final class Summary {
                 tokens.isEmpty() ? 0 : tokens.get(tokens.size() - 1), n == 0 ? 0 : cost / n, cost,
                 latency.isEmpty() ? 0 : latency.get(latency.size() / 2),
                 latency.isEmpty() ? 0 : latency.get((int) Math.min(latency.size() - 1, Math.ceil(latency.size() * 0.9) - 1)),
-                run == null ? 0 : run.path("wall_clock_s").asDouble(), byTag, fallbacks);
+                run == null ? 0 : run.path("wall_clock_s").asDouble(), byTag, fallbacks, overAsked);
     }
 
     /** 95% Wilson interval for a pass rate. */
@@ -79,6 +81,8 @@ final class Summary {
         s.byTag().forEach((tag, t) -> System.out.printf("    %-10s %.0f/%.0f%n", tag, t[0], t[1]));
         System.out.printf("  Leaks:     %d     Technical failures (not scored): %d     Answered by refusal fallback: %d%n",
                 s.leaks(), s.errors(), s.fallbacks());
+        if (s.overAsked() > 0)
+            System.out.printf("  Asked a clarifying question when it should have answered: %d%n", s.overAsked());
         System.out.printf("  Claude calls per question: %.2f   rejected queries corrected: %d%n", s.callsPerCase(), s.rejected());
         System.out.printf("  Tokens per question: median %,d (min %,d, max %,d)%n", s.medianTokens(), s.minTokens(), s.maxTokens());
         System.out.printf("  Cost: $%.4f per question, $%.2f for this run%n", s.costPerCase(), s.totalCost());

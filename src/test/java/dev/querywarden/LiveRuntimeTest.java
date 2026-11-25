@@ -37,7 +37,7 @@ class LiveRuntimeTest {
     @BeforeAll
     static void setup() throws Exception {
         cfg = new Database.Config(PG.getJdbcUrl(), "postgres", "postgres", "qw_agent", "pw");
-        Database.setup(cfg, Policy.defaults());
+        Database.setup(cfg, Policy.demo());
         pool = cfg.agentPool(2);
     }
 
@@ -74,7 +74,7 @@ class LiveRuntimeTest {
     @Test
     void examplesAreWrittenOnceAndCached(@TempDir Path dir) throws Exception {
         Path policy = dir.resolve("policy.yaml");
-        Files.writeString(policy, "schema: shop\n");
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\n");
         Path cache = dir.resolve("cache/examples.json");
         CountingAi ai = new CountingAi();
         LiveRuntime first = new LiveRuntime(cfg, pool, policy.toString(), UNUSED, ai, null, cache);
@@ -90,22 +90,22 @@ class LiveRuntimeTest {
     @Test
     void policyChangesApplyWithoutRestartAndBadFilesAreRefused(@TempDir Path dir) throws Exception {
         Path policy = dir.resolve("policy.yaml");
-        Files.writeString(policy, "schema: shop\n");
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\n");
         LiveRuntime live = new LiveRuntime(cfg, pool, policy.toString(), UNUSED, new CountingAi(), null, null);
         assertFalse(live.check(), "nothing changed yet");
 
-        Files.writeString(policy, "schema: shop\ndefinitions:\n  revenue: \"Excludes cancelled orders.\"\n");
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\ndefinitions:\n  revenue: \"Excludes cancelled orders.\"\n");
         assertTrue(live.check());
         assertTrue(live.get().agent().systemPrompt().contains("- revenue: Excludes cancelled orders."), "new prompt in use");
         assertEquals("policy file changed", live.status().get("last_change_reason"));
 
         Policy good = live.get().policy();
-        Files.writeString(policy, "schema: shop\nblocked_column: {employees: [salary]}\n");   // typo
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\nblocked_column: {employees: [salary]}\n");   // typo
         assertFalse(live.check());
         assertEquals(good, live.get().policy(), "the last good policy stays in use");
         assertTrue(String.valueOf(live.status().get("last_error")).contains("unknown key"), live.status().toString());
 
-        Files.writeString(policy, "schema: shop\n");
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\n");
         assertTrue(live.check());
         assertEquals(null, live.status().get("last_error"), "fixed file clears the error");
     }
@@ -113,7 +113,7 @@ class LiveRuntimeTest {
     @Test
     void newColumnsInTheDatabaseArePickedUp(@TempDir Path dir) throws Exception {
         Path policy = dir.resolve("policy.yaml");
-        Files.writeString(policy, "schema: shop\n");
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\n");
         LiveRuntime live = new LiveRuntime(cfg, pool, policy.toString(), UNUSED, new CountingAi(), null, null);
         try (Connection c = cfg.admin(); Statement st = c.createStatement()) {
             st.execute("ALTER TABLE shop.products ADD COLUMN IF NOT EXISTS colour text");
@@ -133,7 +133,7 @@ class LiveRuntimeTest {
     @Test
     void moreExamplesAvoidsTheCurrentOnes(@TempDir Path dir) throws Exception {
         Path policy = dir.resolve("policy.yaml");
-        Files.writeString(policy, "schema: shop\n");
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\n");
         CountingAi ai = new CountingAi();
         LiveRuntime live = new LiveRuntime(cfg, pool, policy.toString(), UNUSED, ai, null, null);
         List<String> before = live.get().examples().questions();
@@ -147,7 +147,7 @@ class LiveRuntimeTest {
     @Test
     void policyExamplesStillWinWhenGiven(@TempDir Path dir) throws Exception {
         Path policy = dir.resolve("policy.yaml");
-        Files.writeString(policy, "schema: shop\nexamples: [\"My own question\"]\n");
+        Files.writeString(policy, "schema: shop\nallowed_tables: [customers, products, orders, order_items, employees]\nblocked_columns: {employees: [salary, ssn]}\nexamples: [\"My own question\"]\n");
         CountingAi ai = new CountingAi();
         LiveRuntime live = new LiveRuntime(cfg, pool, policy.toString(), UNUSED, ai, null, null);
         assertEquals("policy", live.get().examples().source());

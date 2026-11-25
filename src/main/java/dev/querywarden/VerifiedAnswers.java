@@ -49,13 +49,13 @@ public final class VerifiedAnswers {
 
     private final Path file;
     private List<Answer> answers = List.of();
-    private long loadedStamp = -1;
+    private String loadedStamp = "";
 
     public VerifiedAnswers(Path file) {
         this.file = file;
     }
 
-    /** {@code policy.yaml} → {@code policy.verified.json} in the same folder; built-in defaults → verified.json. */
+    /** {@code policy.yaml} → {@code policy.verified.json} in the same folder; no policy file (demo setup) → verified.json. */
     public static VerifiedAnswers forPolicy(Path policyFile) {
         if (policyFile == null) return new VerifiedAnswers(Path.of("verified.json"));
         String name = policyFile.getFileName().toString().replaceFirst("\\.ya?ml$", "");
@@ -167,11 +167,11 @@ public final class VerifiedAnswers {
         try {
             if (!Files.exists(file)) {
                 answers = List.of();
-                loadedStamp = -1;
+                loadedStamp = "";
                 return;
             }
-            long stamp = Files.getLastModifiedTime(file).toMillis() ^ (Files.size(file) << 20);
-            if (stamp == loadedStamp) return;
+            String stamp = UserStore.stamp(file);
+            if (stamp.equals(loadedStamp)) return;
             JsonNode root = JSON.readTree(file.toFile());
             List<Answer> out = new ArrayList<>();
             for (JsonNode a : root.path("answers")) {
@@ -203,6 +203,6 @@ public final class VerifiedAnswers {
         Files.writeString(tmp, JSON.writerWithDefaultPrettyPrinter().writeValueAsString(Map.of("answers", rows)) + "\n");
         Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         answers = List.copyOf(next);
-        loadedStamp = Files.getLastModifiedTime(file).toMillis() ^ (Files.size(file) << 20);
+        loadedStamp = UserStore.stamp(file);
     }
 }

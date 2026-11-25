@@ -31,7 +31,7 @@ class PostgresGuardrailsTest {
             .withDatabaseName("shop").withUsername("postgres").withPassword("postgres");
 
     static Database.Config cfg;
-    static final Policy POLICY = Policy.defaults();
+    static final Policy POLICY = Policy.demo();
 
     @BeforeAll
     static void setup() throws Exception {
@@ -53,14 +53,14 @@ class PostgresGuardrailsTest {
     @Test
     void categoryValuesOnlyWhenAllowedAndNeverPersonalData() throws Exception {
         assertFalse(Database.describeSchema(cfg, POLICY).contains("values:"), "off by default");
-        Policy on = Policy.parse("share_category_values: true", "test");
+        Policy on = Policy.parse(Policy.demo(), "share_category_values: true", "test");
         String schema = Database.describeSchema(cfg, on);
         assertTrue(schema.contains("country text  -- values: BR, CA, DE"), schema);
         assertTrue(schema.contains("values: cancelled, delivered, pending, shipped"), schema);
         assertFalse(schema.contains("Mia Dubois"), "customer names are not categories");
         assertFalse(schema.contains("example.com"), "emails are never listed");
         assertFalse(schema.contains("Engineering, Marketing") && schema.contains("Kenji"), "employee names are not listed");
-        Policy masked = Policy.parse("share_category_values: true\nmasked_columns: [country]", "test");
+        Policy masked = Policy.parse(Policy.demo(), "share_category_values: true\nmasked_columns: [country]", "test");
         assertFalse(Database.describeSchema(cfg, masked).contains("BR, CA, DE"), "masked columns are never listed");
     }
 
@@ -131,6 +131,7 @@ class PostgresGuardrailsTest {
     static final class FakeGenerator implements SqlGenerator {
         final Deque<Output> outputs;
         final List<String> userTurns = new ArrayList<>();
+        final List<String> systemPrompts = new ArrayList<>();
 
         FakeGenerator(Output... outputs) {
             this.outputs = new ArrayDeque<>(List.of(outputs));
@@ -138,6 +139,7 @@ class PostgresGuardrailsTest {
 
         @Override
         public Conversation open(String systemPrompt) {
+            systemPrompts.add(systemPrompt);
             return text -> {
                 userTurns.add(text);
                 return outputs.removeFirst();
@@ -225,7 +227,7 @@ class PostgresGuardrailsTest {
 
     @Test
     void maskedColumnsAreHiddenWhateverTheirType() throws Exception {
-        Policy maskPrice = Policy.parse("masked_columns: [price]", "test");
+        Policy maskPrice = Policy.parse(Policy.demo(), "masked_columns: [price]", "test");
         var r = new SafeExecutor(cfg, maskPrice).execute("SELECT name, price FROM products LIMIT 2");
         r.rows().forEach(row -> assertEquals("***", row.get(1)));
         assertEquals(List.of("text", "text"), r.columnTypes(), "a masked column is reported as text");
@@ -340,6 +342,111 @@ class PostgresGuardrailsTest {
         var res = agent(gen2, null).withVerified(lib).ask("average salary");
         assertEquals(QueryWardenAgent.Status.UNANSWERABLE, res.status(), "the outdated verified SQL is not run");
         assertTrue(res.attempts().stream().anyMatch(a -> a.status().equals("verified_skipped")));
+    }
+
+    // ------------------------------------------------------------------ clarifying questions
+    static final SqlGenerator.Output ASKS = SqlGenerator.Output.clarify("By revenue or by units sold?",
+            List.of("By revenue", "By units sold", "By number of orders"));
+
+    @Test
+    void vagueQuestionGetsAClarifyingQuestionWithChoices(@TempDir Path dir) throws Exception {
+        Path audit = dir.resolve("audit.jsonl");
+        var gen = new FakeGenerator(ASKS);
+        var res = agent(gen, audit).ask("Which products are popular?");
+        assertEquals(QueryWardenAgent.Status.CLARIFY, res.status());
+        assertEquals("By revenue or by units sold?", res.message());
+        assertEquals(3, res.clarifyOptions().size());
+        assertTrue(res.sql().isEmpty() && res.result() == null, "nothing was run");
+        assertTrue(gen.systemPrompts.get(0).contains("Clarifying questions:"), "the prompt allows asking");
+        assertTrue(Files.readString(audit).contains("\"clarify_options\""), "the audit log records the choices");
+    }
+
+    @Test
+    void neverAsksTwiceInARow() throws Exception {
+        // the person has picked a reading: a second clarifying question is refused and Claude is told to answer
+        var gen = new FakeGenerator(ASKS, ok("SELECT category, COUNT(*) AS n FROM products GROUP BY category"));
+        var res = agent(gen, null).ask("Which products are popular? \u2014 By units sold", "cli", p -> { }, List.of(), false);
+        assertEquals(QueryWardenAgent.Status.OK, res.status(), res.message());
+        assertTrue(gen.userTurns.get(0).contains("already chosen"), gen.userTurns.get(0));
+        assertTrue(gen.userTurns.get(1).contains("Don't ask a clarifying question"), gen.userTurns.get(1));
+        assertTrue(res.attempts().stream().anyMatch(a -> a.status().equals("clarify_refused")));
+    }
+
+    @Test
+    void aQuestionWithFewerThanTwoChoicesIsNotAsked() throws Exception {
+        var gen = new FakeGenerator(SqlGenerator.Output.clarify("Which one?", List.of("Only choice")),
+                ok("SELECT COUNT(*) FROM products"));
+        var res = agent(gen, null).ask("How many products?");
+        assertEquals(QueryWardenAgent.Status.OK, res.status());
+    }
+
+    @Test
+    void clarifyingCanBeSwitchedOffInThePolicy() throws Exception {
+        Policy off = Policy.parse(Policy.demo(), "ask_clarifying_questions: false", "test");
+        var gen = new FakeGenerator(ASKS, ok("SELECT COUNT(*) FROM products"));
+        var res = new QueryWardenAgent(cfg, off, gen, 3, null).ask("Which products are popular?");
+        assertEquals(QueryWardenAgent.Status.OK, res.status());
+        assertTrue(gen.systemPrompts.get(0).contains("Never ask clarifying questions"));
+        assertFalse(gen.systemPrompts.get(0).contains("Clarifying questions:"));
+    }
+
+    // ------------------------------------------------------------------ large schemas, metrics, saved questions
+    @Test
+    void largeDatabasesGetOnlyTheRelevantTablesAndClaudeCanAskForMore() throws Exception {
+        Policy small = Policy.parse(Policy.demo(), "limits: {max_tables_in_prompt: 2}", "test");
+        var gen = new FakeGenerator(new SqlGenerator.Output(false, "", "", "NEED_TABLES: employees"),
+                ok("SELECT department, COUNT(*) AS n FROM employees GROUP BY department"));
+        var progress = new ArrayList<String>();
+        var res = new QueryWardenAgent(cfg, small, gen, 3, null)
+                .ask("How many products per category?", "cli", p -> progress.add(p.text()), List.of());
+        assertEquals(QueryWardenAgent.Status.OK, res.status(), res.message());
+        String first = gen.systemPrompts.get(0);
+        assertTrue(first.contains("TABLE products"), first);
+        assertFalse(first.contains("TABLE employees"), "only the relevant tables are described");
+        assertTrue(first.contains("These exist too") && first.contains("employees"), "the others are listed by name");
+        assertTrue(gen.systemPrompts.get(1).contains("TABLE employees"), "shown after Claude asked for it");
+        assertTrue(res.attempts().stream().anyMatch(a -> a.status().equals("need_tables")));
+        assertTrue(progress.stream().anyMatch(t -> t.startsWith("Picked 2 of 5 tables")), progress.toString());
+        assertTrue(new QueryWardenAgent(cfg, POLICY, new FakeGenerator(), 3, null).systemPrompt().contains("TABLE employees"),
+                "small databases still get every table, in a prompt that can be cached");
+    }
+
+    @Test
+    void metricsAreInThePromptAndRunInDoctor() throws Exception {
+        Policy p = Policy.parse(Policy.demo(), MetricsTablesSavedTest.METRICS, "test");
+        var gen = new FakeGenerator(ok("SELECT 1"));
+        new QueryWardenAgent(cfg, p, gen, 3, null).ask("Revenue in 2025?");
+        assertTrue(gen.systemPrompts.get(0).contains("SUM(oi.quantity * oi.unit_price) AS revenue"));
+        var findings = Doctor.check(cfg, p);
+        assertTrue(findings.stream().anyMatch(f -> f.message().equals("All 1 metrics run.")), findings.toString());
+        Policy typo = Policy.parse(Policy.demo(), """
+                metrics:
+                  n: {description: N, sql: COUNT(oi.qty), from: order_items oi}
+                """, "test");
+        assertTrue(Doctor.check(cfg, typo).stream().anyMatch(f -> f.message().startsWith("Metric 'n' doesn't run")));
+    }
+
+    @Test
+    void scheduledRunsRecordValuesAndRaiseAlertsOnce(@TempDir Path dir) throws Exception {
+        SavedQuestions store = new SavedQuestions(dir.resolve("saved.json"));
+        var agent = agent(new FakeGenerator(), dir.resolve("audit.jsonl"));
+        var sched = new SavedScheduler(store, () -> agent, dir.resolve("alerts.jsonl"), null, java.time.ZoneOffset.UTC);
+        var s = store.add("Orders", "How many orders?", "SELECT COUNT(*) AS n FROM orders", "ann", "every 15m",
+                new SavedQuestions.Alert("n", ">", 1.0));
+        var bad = store.add("Salaries", "Salaries", "SELECT salary FROM employees", "ann", "every 15m", null);
+        java.time.Instant later = java.time.Instant.parse(s.created()).plusSeconds(16 * 60);
+        assertEquals(2, sched.tick(later));
+        var after = store.get(s.id()).orElseThrow();
+        assertEquals("ok", after.lastStatus());
+        assertTrue(after.alerting(), after.toString());
+        assertEquals(1, sched.recentAlerts(10).size());
+        assertEquals("failed", store.get(bad.id()).orElseThrow().lastStatus(), "the saved SQL is checked on every run");
+        assertTrue(store.get(bad.id()).orElseThrow().lastMessage().contains("safety rules"));
+
+        assertEquals(0, sched.tick(later.plusSeconds(60)), "not due again yet");
+        sched.tick(later.plusSeconds(20 * 60));
+        assertEquals(1, sched.recentAlerts(10).size(), "still alerting: no second alert");
+        assertTrue(Files.readString(dir.resolve("audit.jsonl")).contains("\"schedule\""), "scheduled runs are audited");
     }
 
     @Test

@@ -24,7 +24,7 @@ class SetupSafetyTest {
     static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:16-alpine")
             .withDatabaseName("realdb").withUsername("postgres").withPassword("postgres");
 
-    static final Policy POLICY = Policy.defaults();
+    static final Policy POLICY = Policy.demo();
     Database.Config cfg;
 
     @BeforeEach

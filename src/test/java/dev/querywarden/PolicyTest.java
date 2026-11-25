@@ -21,12 +21,13 @@ class PolicyTest {
     @Test
     void shippedPolicyFileMatchesBuiltInDefaults() throws Exception {
         Policy shipped = Policy.load(Path.of("policy.yaml"));
-        Policy d = Policy.defaults();
+        Policy d = Policy.demo();
         // The guardrails must match exactly; only the demo's examples and result sharing differ.
         assertEquals(new Policy(d.schema(), d.allowedTables(), d.blockedColumns(), d.maskedColumns(), d.maxRows(),
                         d.timeoutMillis(), d.maxJoins(), d.maxSelects(), d.maxQuestionChars(), d.maxSqlChars(),
                         d.blockedFunctions(), shipped.examples(), shipped.shareResultsWithAi(), shipped.definitions(),
-                        shipped.shareCategoryValues()),
+                        shipped.shareCategoryValues(), shipped.askClarifyingQuestions(), shipped.metrics(),
+                        d.maxTablesInPrompt()),
                 shipped, "policy.yaml in the project root should describe the demo database exactly");
         assertTrue(shipped.examples().isEmpty(), "the demo lets Claude write the example questions");
         assertTrue(shipped.shareResultsWithAi(), "demo data is fake, so the demo shares results");
@@ -37,34 +38,45 @@ class PolicyTest {
     }
 
     @Test
+    void clarifyingQuestionsAreOnByDefaultAndCanBeSwitchedOff() throws Exception {
+        assertTrue(Policy.demo().askClarifyingQuestions());
+        Policy off = Policy.parse(Policy.demo(), "ask_clarifying_questions: false", "test");
+        assertFalse(off.askClarifyingQuestions());
+        assertEquals(off, Policy.parse(Policy.demo(), off.toYaml(), "roundtrip"));
+        assertTrue(off.toYaml().contains("ask_clarifying_questions: false"));
+        var e = assertThrows(Policy.PolicyException.class, () -> Policy.parse(Policy.demo(), "ask_clarifying_questions: maybe", "t"));
+        assertTrue(e.getMessage().contains("true or false"));
+    }
+
+    @Test
     void definitionsKeepTheirOrderAndAreValidated() throws Exception {
-        Policy p = Policy.parse("""
+        Policy p = Policy.parse(Policy.demo(), """
                 definitions:
                   revenue: "Sum of quantity * unit_price, excluding cancelled orders."
                   open order: "Status pending or shipped."
                 """, "test");
         assertEquals(List.of("revenue", "open order"), List.copyOf(p.definitions().keySet()));
         assertTrue(p.definitionsText().startsWith("- revenue: Sum of quantity"));
-        assertEquals(p, Policy.parse(p.toYaml(), "roundtrip"));
+        assertEquals(p, Policy.parse(Policy.demo(), p.toYaml(), "roundtrip"));
 
-        var e1 = assertThrows(Policy.PolicyException.class, () -> Policy.parse("definitions: [revenue]", "t"));
+        var e1 = assertThrows(Policy.PolicyException.class, () -> Policy.parse(Policy.demo(), "definitions: [revenue]", "t"));
         assertTrue(e1.getMessage().contains("must map a term"));
-        var e2 = assertThrows(Policy.PolicyException.class, () -> Policy.parse("definitions:\n  revenue: \"\"", "t"));
+        var e2 = assertThrows(Policy.PolicyException.class, () -> Policy.parse(Policy.demo(), "definitions:\n  revenue: \"\"", "t"));
         assertTrue(e2.getMessage().contains("must be a sentence"));
         assertTrue(Policy.load(Path.of("policy.yaml")).definitions().containsKey("revenue"), "the demo policy defines revenue");
     }
 
     @Test
     void definitionsReachClaudesInstructions() throws Exception {
-        Policy p = Policy.parse("definitions:\n  revenue: \"Excludes cancelled orders.\"", "t");
+        Policy p = Policy.parse(Policy.demo(), "definitions:\n  revenue: \"Excludes cancelled orders.\"", "t");
         String block = QueryWardenAgent.definitionsBlock(p);
         assertTrue(block.contains("Business definitions") && block.contains("- revenue: Excludes cancelled orders."));
-        assertEquals("", QueryWardenAgent.definitionsBlock(Policy.defaults()), "no section when there are none");
+        assertEquals("", QueryWardenAgent.definitionsBlock(Policy.demo()), "no section when there are none");
     }
 
     @Test
     void examplesAndResultSharing() throws Exception {
-        Policy p = Policy.parse("""
+        Policy p = Policy.parse(Policy.demo(), """
                 examples:
                   - "Orders: how many per status?"
                   - Revenue by month
@@ -72,18 +84,18 @@ class PolicyTest {
                 """, "test");
         assertEquals(List.of("Orders: how many per status?", "Revenue by month"), p.examples());
         assertTrue(p.shareResultsWithAi());
-        assertEquals(p, Policy.parse(p.toYaml(), "roundtrip"), "questions with colons survive toYaml");
+        assertEquals(p, Policy.parse(Policy.demo(), p.toYaml(), "roundtrip"), "questions with colons survive toYaml");
     }
 
     @Test
     void emptyFileMeansDefaults() throws Exception {
-        assertEquals(Policy.defaults(), Policy.parse("", "test"));
-        assertEquals(Policy.defaults(), Policy.parse("# only a comment\n", "test"));
+        assertEquals(Policy.demo(), Policy.parse(Policy.demo(), "", "test"));
+        assertEquals(Policy.demo(), Policy.parse(Policy.demo(), "# only a comment\n", "test"));
     }
 
     @Test
     void readsACustomPolicyAndKeepsDefaultsForMissingKeys() throws Exception {
-        Policy p = Policy.parse("""
+        Policy p = Policy.parse(Policy.demo(), """
                 schema: Public
                 allowed_tables: [Invoices, payments]
                 blocked_columns:
@@ -98,20 +110,20 @@ class PolicyTest {
         assertTrue(p.isMasked("iban"));
         assertFalse(p.isMasked("email"), "masked_columns replaces the default list");
         assertEquals(50, p.maxRows());
-        assertEquals(Policy.defaults().timeoutMillis(), p.timeoutMillis(), "unset limits keep their defaults");
+        assertEquals(Policy.demo().timeoutMillis(), p.timeoutMillis(), "unset limits keep their defaults");
     }
 
     @Test
     void blockedFunctionsAddToTheBuiltInListAndNeverReplaceIt() throws Exception {
-        Policy p = Policy.parse("blocked_functions: [my_audit_fn]", "test");
+        Policy p = Policy.parse(Policy.demo(), "blocked_functions: [my_audit_fn]", "test");
         assertTrue(p.functionBlocked("my_audit_fn"));
         assertTrue(p.functionBlocked("pg_sleep"), "built-in dangerous functions stay blocked");
-        assertTrue(Policy.parse("blocked_functions: []", "test").functionBlocked("pg_read_file"));
+        assertTrue(Policy.parse(Policy.demo(), "blocked_functions: []", "test").functionBlocked("pg_read_file"));
     }
 
     @Test
     void blockedColumnsCanBeCleared() throws Exception {
-        Policy p = Policy.parse("blocked_columns: {}", "test");
+        Policy p = Policy.parse(Policy.demo(), "blocked_columns: {}", "test");
         assertTrue(p.blockedColumns().isEmpty());
     }
 
@@ -133,7 +145,7 @@ class PolicyTest {
             "share_results_with_ai: yes please                       | share_results_with_ai must be true or false",
     })
     void rejectsMistakesWithAClearMessage(String yaml, String expected) {
-        var e = assertThrows(Policy.PolicyException.class, () -> Policy.parse(yaml.replace("\\n", "\n"), "test.yaml"));
+        var e = assertThrows(Policy.PolicyException.class, () -> Policy.parse(Policy.demo(), yaml.replace("\\n", "\n"), "test.yaml"));
         assertTrue(e.getMessage().contains(expected), e.getMessage());
         assertTrue(e.getMessage().startsWith("test.yaml"), "error names the file: " + e.getMessage());
     }
@@ -155,7 +167,7 @@ class PolicyTest {
 
     @Test
     void yamlOutputRoundTrips() throws Exception {
-        Policy p = Policy.parse("""
+        Policy p = Policy.parse(Policy.demo(), """
                 schema: public
                 allowed_tables: [a, b]
                 blocked_columns: {b: [secret]}
@@ -163,12 +175,12 @@ class PolicyTest {
                 blocked_functions: [extra_fn]
                 limits: {max_rows: 10, timeout_ms: 500}
                 """, "test");
-        assertEquals(p, Policy.parse(p.toYaml(), "roundtrip"));
+        assertEquals(p, Policy.parse(Policy.demo(), p.toYaml(), "roundtrip"));
     }
 
     @Test
     void customPolicyDrivesTheValidator() throws Exception {
-        Policy p = Policy.parse("""
+        Policy p = Policy.parse(Policy.demo(), """
                 allowed_tables: [orders]
                 blocked_columns: {orders: [status]}
                 """, "test");
