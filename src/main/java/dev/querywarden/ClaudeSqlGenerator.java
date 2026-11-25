@@ -46,14 +46,20 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
     private final boolean useFallbacks;
 
     public ClaudeSqlGenerator(boolean useFallbacks) {
-        this(AnthropicOkHttpClient.fromEnv(), MODEL, BetaOutputConfig.Effort.MEDIUM, useFallbacks);
+        this(ModelSettings.defaults(), useFallbacks);
+    }
+
+    public ClaudeSqlGenerator(ModelSettings models, boolean useFallbacks) {
+        this(AnthropicOkHttpClient.fromEnv(), models.sqlModel(), ModelSettings.effortValue(models.sqlEffort()),
+                useFallbacks);
     }
 
     public ClaudeSqlGenerator(AnthropicClient client, String model, BetaOutputConfig.Effort effort, boolean useFallbacks) {
         this.client = client;
         this.model = model;
         this.effort = effort;
-        this.useFallbacks = useFallbacks;
+        // Only some models support the server-side refusal fallback; never send it to others.
+        this.useFallbacks = useFallbacks && ModelSettings.supportsServerFallback(model);
     }
 
     @Override
@@ -90,10 +96,11 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
                 throw classify(e);
             }
             history.add(resp.toParam());
+            Usage usage = Usage.of(resp);
 
             BetaStopReason stop = resp.stopReason().orElse(null);
             if (BetaStopReason.REFUSAL.equals(stop)) {
-                return new Output(false, "", "", "The model declined this request.");
+                return new Output(false, "", "", "The model declined this request.", usage);
             }
             if (BetaStopReason.MAX_TOKENS.equals(stop)) {
                 throw new GeneratorException("The AI's answer was cut off. Try a simpler question.",
@@ -108,7 +115,7 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
             try {
                 JsonNode n = JSON.readTree(text);
                 return new Output(n.path("answerable").asBoolean(false), n.path("sql").asText(""),
-                        n.path("explanation").asText(""), n.path("reason").asText(""));
+                        n.path("explanation").asText(""), n.path("reason").asText(""), usage);
             } catch (Exception e) {
                 throw new GeneratorException("The AI returned an answer that couldn't be read. Please try again.",
                         "invalid JSON from model: " + e.getMessage(), e);

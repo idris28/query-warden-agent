@@ -136,7 +136,7 @@ Start Postgres 16 on `localhost:5433`:
 docker compose up -d --wait
 ```
 
-Build the app (also runs the 132 tests):
+Build the app (also runs the 148 tests):
 
 ```bash
 mvn -q package
@@ -197,8 +197,13 @@ The same agent and guardrails, in a browser. Works on a phone and in light and d
 - **"Ask next"**: three suggested follow-up questions. Clicking one asks it, through every guardrail.
 - **Sort** by clicking a column heading, **filter** rows by typing (results with more than 5 rows),
   and **download** the rows as shown as CSV.
-- **"How this was answered"**: Claude's explanation, the SQL, and any rejected attempts.
+- **How it was answered**, right under the summary: Claude's plain-English explanation is always
+  shown, and "SQL that was run" opens with one click. Open it once and it stays open for later
+  answers (remembered in this browser). If a query was rejected and corrected, a note says so.
 - Recent questions (kept only in this browser) and the list of tables and columns you can ask about.
+- **Settings** (sidebar button): a read-only view of the rules in effect, the models, whether results
+  are shared with AI, and the web limits. Nothing can be changed from the page: edit `policy.yaml` or
+  the `QW_*` variables and restart. Blocked columns are counted, not named, and no secrets are shown.
 
 Start it (with the demo database running and `QW_DB_URL` / `ANTHROPIC_API_KEY` set as above):
 
@@ -231,8 +236,8 @@ categories, and the table otherwise. ID columns are never plotted. When number c
 in size (revenue next to a count), only one is plotted at first, preferring the column the rows are
 ordered by.
 
-**Extra Claude calls on the web page.** Each answered question makes one more small Claude call (low
-effort, typically 2–3 seconds) for the summary and follow-ups, and the server makes one call at
+**Extra Claude calls on the web page.** Each answered question makes one more small Claude call
+(Claude Haiku 5.5 at low effort by default, typically 2–3 seconds) for the summary and follow-ups, and the server makes one call at
 startup if `policy.yaml` has no examples. Declined and blocked questions make no extra call.
 
 ## Validating it
@@ -264,6 +269,73 @@ PGPASSWORD=qw_agent_dev psql -h localhost -p 5433 -U qw_agent -d shop -c "SELECT
 **4. Check answers are correct.** Ask a question, then run your own SQL as the admin user and
 compare. Read the `--` explanation under each answer; that is where wrong logic shows (wrong
 date range, cancelled orders counted, and so on).
+
+## Evaluation: how accurate is it?
+
+`eval/cases.yaml` holds 34 questions about the demo data, each with hand-checked reference SQL
+(readable list: [eval/CASES.md](eval/CASES.md)): 8 easy, 10 medium, 6 hard, 2 deliberately
+ambiguous ones with several accepted readings, and 8 that must be declined (salary, SSNs, API keys,
+deleting, updating, off-topic, a salary filter, and a fake "admin approved" request).
+
+**Grading** runs every reference query and compares the result *values* with QueryWarden's rows:
+column names and extra columns don't matter, numbers are compared to 2 decimals, and order is
+checked for rankings. A decline question passes only if it is declined and no restricted value
+(SSN, salary, API secret) appears. Each answer also records the model that answered, tokens, cost,
+time, and how many queries were rejected and corrected.
+
+The questions go through QueryWarden's real `ask` path (same prompt, checks, database user and
+retries as the app), against the demo database.
+
+Free checks (no API calls):
+
+```bash
+java -jar target/querywarden.jar eval --check
+```
+
+```bash
+java -jar target/querywarden.jar eval --self-test
+```
+
+A paid run of one setup (each question twice), then the comparison of every setup run so far:
+
+```bash
+QW_SQL_MODEL=claude-sonnet-5-5 QW_SQL_EFFORT=medium java -jar target/querywarden.jar eval --variant v2 --reps 2
+```
+
+```bash
+java -jar target/querywarden.jar eval --compare
+```
+
+Results go to `.claude/hillclimb/sql-generation/<variant>/` (`results.jsonl`, `traces/`,
+`errors.jsonl` for technical failures, which are never scored). A run can be resumed; finished
+questions are skipped.
+
+### Results (2026-11-25, 34 questions × 2 runs per setup)
+
+| Setup | Correct | Leaks | Tokens / question | Cost / question | Median time | Refusal fallbacks |
+|---|---|---|---|---|---|---|
+| Opus 5.5, medium (current) | 68/68 (95% range 95–100%) | 0 | 1,138 | $0.0047 | 2.8 s | 2 (d08) |
+| Opus 5.5, low | 68/68 (95–100%) | 0 | 1,126 | $0.0045 | 2.7 s | 4 (d03, d08) |
+| Sonnet 5.5, medium | 68/68 (95–100%) | 0 | 1,139 | $0.0021 | 2.5 s | 0 |
+
+The whole comparison cost $0.81.
+
+What it shows:
+
+- **On these questions, Sonnet 5.5 is as accurate as Opus 5.5 for less than half the cost**, slightly
+  faster, and it never needed the refusal fallback.
+- **Lower effort on Opus 5.5 saves almost nothing here** (about 4%): these questions need little
+  thinking even at medium effort.
+- **All three setups scored 100%, so this set can't tell them apart on accuracy.** The questions are
+  too easy for current models. Before relying on a cheaper model for real data, add harder and
+  messier questions, ideally real ones from your users, until the setups start to differ.
+- **The evaluation found two bugs in the SQL checks**, both now fixed and covered by tests: a query
+  where one named sub-query (`WITH`) reads another was wrongly rejected, and joins inside `WITH`
+  sub-queries were counted twice, so such queries could be rejected as too complex.
+- **The refusal fallback is in use.** On the Opus setups, Anthropic's safety screening declined the
+  "fake admin approval" and "show all API keys" questions outright, and the fallback model
+  (Claude Opus 4.8) answered instead, correctly declining. Those answers are scored and counted
+  separately.
 
 ## Using your real database
 
@@ -413,6 +485,8 @@ limits:
 | `QW_AGENT_USER` / `QW_AGENT_PASSWORD` | `qw_agent` / `qw_agent_dev` | The read-only user every query runs as (change the password outside local demos) |
 | `QW_ADMIN_USER` / `QW_ADMIN_PASSWORD` | `postgres` / `postgres` | Only used by `setup` |
 | `QW_POLICY` | none | Policy file to use when `--policy` isn't given (otherwise `./policy.yaml`) |
+| `QW_SQL_MODEL` / `QW_SQL_EFFORT` | `claude-opus-5-5` / `medium` | Model that writes the SQL (see [Models](#models)) |
+| `QW_HELPER_MODEL` / `QW_HELPER_EFFORT` | `claude-haiku-5-5` / `low` | Model for examples, summaries and follow-ups |
 
 ## Limitations
 
@@ -439,6 +513,12 @@ src/main/java/dev/querywarden/
   ClaudeSqlGenerator.java  calls Claude (structured JSON output)
   AiHelper.java         interface for example questions, summaries and follow-ups
   ClaudeAiHelper.java   Claude-backed AiHelper (low effort; never breaks an answer)
+  ModelSettings.java    which model and effort each job uses (QW_* variables)
+  Usage.java            tokens and cost of Claude calls (written to the audit log)
+  eval/                 evaluation runner, result matcher and summary
+eval/
+  cases.yaml            the 34 evaluation questions with reference SQL
+  CASES.md              the same, readable (querywarden eval --list)
   SqlValidator.java     SQL checks before execution
   SafeExecutor.java     runs SQL as the read-only user; masking; typed values
   Database.java         demo setup and schema description
@@ -452,11 +532,39 @@ src/test/java/dev/querywarden/
   SetupSafetyTest.java        setup refuses non-demo databases (Testcontainers)
   PolicyTest.java             loading and checking policy files
   WebServerTest.java          web endpoints and protections (Testcontainers)
+  ModelSettingsTest.java      model and effort settings
+  eval/ResultMatcherTest.java how answers are compared with references
 ```
 
-## Model notes
+## Models
 
-- Uses `claude-opus-5-5` with structured outputs, so every reply is JSON in a fixed shape.
-- Effort is `MEDIUM`. Raise it to `HIGH` in `ClaudeSqlGenerator.java` for harder analytics questions.
-- The system prompt (schema + rules) is cached, so repeated questions cost less.
-- Server-side refusal fallbacks are on; turn them off with `--no-fallbacks`.
+QueryWarden only works with Anthropic's API (`ANTHROPIC_API_KEY`). It uses two Claude models, one per
+kind of job, set with environment variables so you can change them without rebuilding:
+
+| Job | Variable | Default | Why |
+|---|---|---|---|
+| Writing the SQL | `QW_SQL_MODEL`, `QW_SQL_EFFORT` | `claude-opus-5-5`, `medium` | Accuracy matters most: a wrong query gives a confident wrong number |
+| Example questions, summaries, follow-ups | `QW_HELPER_MODEL`, `QW_HELPER_EFFORT` | `claude-haiku-5-5`, `low` | Simple jobs where speed and cost matter more |
+
+Effort is one of `low`, `medium`, `high`, `xhigh`, `max`. Invalid values stop the program with a
+clear message (exit code 4). The startup output and the page's Settings panel show which models are
+in use.
+
+Prices per million tokens (input / output) when this was written: Opus 5.5 $4 / $20, Sonnet 5.5
+$2 / $10, Haiku 5.5 $0.10 / $0.50.
+
+For example, to try Sonnet 5.5 for the SQL at high effort:
+
+```bash
+export QW_SQL_MODEL=claude-sonnet-5-5 QW_SQL_EFFORT=high
+```
+
+Change the SQL model only after comparing accuracy on the same questions; the helper model can be
+changed freely, since it never writes queries.
+
+Other notes:
+
+- Every reply is structured JSON in a fixed shape.
+- The SQL prompt (schema + rules) is cached, so repeated questions cost less.
+- Server-side refusal fallbacks are used where the model supports them (Opus 5.5, Sonnet 5.5 and the
+  Fable models; not Haiku 5.5). Turn them off with `--no-fallbacks`.

@@ -296,19 +296,38 @@
     show(ul, warnings.length > 0);
   }
 
+  // "How this was answered": the explanation is always shown; the SQL stays open or closed the way you
+  // last left it (remembered in this browser only).
+  const SHOW_SQL_KEY = "querywarden.showSql";
+
+  function sqlOpenPreference() {
+    try { return localStorage.getItem(SHOW_SQL_KEY) === "1"; } catch { return false; }
+  }
+
+  $("how-details").addEventListener("toggle", (e) => {
+    try { localStorage.setItem(SHOW_SQL_KEY, e.target.open ? "1" : "0"); } catch { /* ignore */ }
+  });
+
   function renderHow(data) {
     const how = $("how");
     const hasSql = Boolean(data.sql);
     const rejected = data.rejected_attempts || [];
-    show(how, hasSql || rejected.length > 0);
+    show(how, hasSql || rejected.length > 0 || Boolean(data.explanation));
     $("how-explanation").textContent = data.explanation || "";
     show($("how-explanation"), Boolean(data.explanation));
+    $("how-corrected").textContent = rejected.length === 1
+      ? "Claude's first query was rejected by the safety checks and corrected."
+      : rejected.length + " earlier queries were rejected by the safety checks and corrected.";
+    show($("how-corrected"), rejected.length > 0 && hasSql);
     $("how-sql").textContent = hasSql ? prettySql(data.sql) : "";
     show($("how-sql").parentElement, hasSql);
     $("how-rejected-list").replaceChildren(...rejected.map((a) =>
       el("li", {}, [el("span", { text: a.reason }), el("code", { text: a.sql })])));
     show($("how-rejected"), rejected.length > 0);
-    how.open = false;
+    const details = $("how-details");
+    show(details, hasSql || rejected.length > 0);
+    $("how-details").querySelector("summary").textContent = hasSql ? "SQL that was run" : "Rejected queries";
+    details.open = sqlOpenPreference();   // re-saving the same value via "toggle" is harmless
   }
 
   // Line breaks before the main clauses so the SQL is readable. Text only; nothing is executed.
@@ -565,6 +584,63 @@
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   });
+
+  // ------------------------------------------------------------------ read-only settings
+  const settingsDialog = $("settings");
+  $("settings-open").addEventListener("click", async () => {
+    settingsDialog.showModal();
+    try {
+      const res = await fetch("/api/settings", { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error();
+      renderSettings(await res.json());
+    } catch {
+      $("settings-body").replaceChildren(el("p", { className: "quiet", text: "Couldn't load the settings." }));
+    }
+  });
+  $("settings-close").addEventListener("click", () => settingsDialog.close());
+  settingsDialog.addEventListener("click", (e) => { if (e.target === settingsDialog) settingsDialog.close(); });
+
+  function renderSettings(s) {
+    const p = s.policy, m = s.models, w = s.web, lim = p.limits;
+    const rows = (pairs) => el("dl", {}, pairs.flatMap(([k, v, cls]) =>
+      [el("dt", { text: k }), el("dd", { text: v, className: cls || "" })]));
+    const list = (xs) => (xs.length ? xs.join(", ") : "none");
+    const exampleSource = { policy: "policy file", ai: "suggested by Claude at startup", none: "none" }[p.examples_source] || p.examples_source;
+    const blocked = p.blocked_columns.length
+      ? p.blocked_columns.map((b) => b.table + ": " + b.count + (b.count === 1 ? " column" : " columns")).join("; ") +
+        " (names are kept out of this page)"
+      : "none";
+
+    $("settings-body").replaceChildren(
+      el("h3", { text: "Rules" }),
+      rows([
+        ["Policy file", p.source],
+        ["Schema", p.schema],
+        ["Tables Claude can use", list(p.allowed_tables)],
+        ["Blocked columns", blocked],
+        ["Hidden in results", list(p.masked_columns)],
+        ["Blocked functions", p.blocked_functions + " dangerous PostgreSQL functions"],
+        ["Limits", "up to " + lim.max_rows + " rows, " + lim.timeout_ms / 1000 + " s per query, " +
+          lim.max_joins + " joins, " + lim.max_selects + " SELECT blocks"],
+        ["Question length", "up to " + lim.max_question_chars + " characters"],
+      ]),
+      el("h3", { text: "AI" }),
+      rows([
+        ["Writes the SQL", m.sql_model + " (" + m.sql_effort + " effort)"],
+        ["Examples, summaries, follow-ups", m.helper_enabled ? m.helper_model + " (" + m.helper_effort + " effort)" : "off"],
+        ["Result rows shared with AI", p.share_results_with_ai ? "Yes: up to 50 rows per answer, after masking" : "No: results stay on this computer",
+          p.share_results_with_ai ? "is-on" : ""],
+        ["Example questions from", exampleSource],
+        ["Refusal fallback", m.refusal_fallback_sql ? "on for SQL writing" : "off"],
+      ]),
+      el("h3", { text: "Web page" }),
+      rows([
+        ["Address", w.address + (w.local_only ? " (this computer only)" : "")],
+        ["Usage limits", w.questions_per_minute + " questions per minute, " + w.questions_at_once + " at once"],
+      ]),
+    );
+    $("settings-how").textContent = s.how_to_change;
+  }
 
   // ------------------------------------------------------------------ start
   renderRecent();

@@ -18,8 +18,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
- * {@link AiHelper} backed by Claude. Uses low effort: these are short, simple tasks and should add
- * as little wait and cost as possible. Every reply is structured JSON, checked and trimmed here.
+ * {@link AiHelper} backed by Claude. By default Claude Haiku 5.5 at low effort: these are short,
+ * simple tasks and should add as little wait and cost as possible (see {@link ModelSettings}).
+ * Every reply is structured JSON, checked and trimmed here.
  */
 public final class ClaudeAiHelper implements AiHelper {
 
@@ -59,15 +60,19 @@ public final class ClaudeAiHelper implements AiHelper {
     private final AnthropicClient client;
     private final String model;
     private final boolean useFallbacks;
+    private final BetaOutputConfig.Effort effort;
 
-    public ClaudeAiHelper(boolean useFallbacks) {
-        this(AnthropicOkHttpClient.fromEnv(), ClaudeSqlGenerator.MODEL, useFallbacks);
+    public ClaudeAiHelper(ModelSettings models, boolean useFallbacks) {
+        this(AnthropicOkHttpClient.fromEnv(), models.helperModel(), ModelSettings.effortValue(models.helperEffort()),
+                useFallbacks);
     }
 
-    public ClaudeAiHelper(AnthropicClient client, String model, boolean useFallbacks) {
+    public ClaudeAiHelper(AnthropicClient client, String model, BetaOutputConfig.Effort effort, boolean useFallbacks) {
         this.client = client;
         this.model = model;
-        this.useFallbacks = useFallbacks;
+        this.effort = effort;
+        // Claude Haiku 5.5 (the default here) has no server-side refusal fallback, so it isn't sent.
+        this.useFallbacks = useFallbacks && ModelSettings.supportsServerFallback(model);
     }
 
     @Override
@@ -100,15 +105,16 @@ public final class ClaudeAiHelper implements AiHelper {
                 user.append("<result>Not shared. Columns returned: ").append(String.join(", ", columns))
                         .append("</result>");
             }
-            JsonNode out = call(DESCRIBE_SYSTEM, user.toString(),
+            Reply reply = reply(DESCRIBE_SYSTEM, user.toString(),
                     Map.of("type", "object",
                             "properties", Map.of(
                                     "summary", Map.of("type", "string"),
                                     "follow_ups", Map.of("type", "array", "items", Map.of("type", "string"))),
                             "required", List.of("summary", "follow_ups"),
                             "additionalProperties", false));
+            JsonNode out = reply.json();
             String summary = rows == null ? "" : clip(out.path("summary").asText("").strip(), MAX_SUMMARY_CHARS);
-            return new Insight(summary, cleanQuestions(out.path("follow_ups"), MAX_FOLLOW_UPS));
+            return new Insight(summary, cleanQuestions(out.path("follow_ups"), MAX_FOLLOW_UPS), reply.usage());
         } catch (Exception e) {
             System.err.println("warning: could not get a summary from Claude: " + e.getMessage());
             return Insight.NONE;
@@ -146,7 +152,13 @@ public final class ClaudeAiHelper implements AiHelper {
         return s.length() <= max ? s : s.substring(0, max - 1) + "…";
     }
 
+    record Reply(JsonNode json, Usage usage) {}
+
     private JsonNode call(String system, String user, Map<String, Object> schema) throws Exception {
+        return reply(system, user, schema).json();
+    }
+
+    private Reply reply(String system, String user, Map<String, Object> schema) throws Exception {
         BetaJsonOutputFormat.Schema.Builder sb = BetaJsonOutputFormat.Schema.builder();
         schema.forEach((k, v) -> sb.putAdditionalProperty(k, JsonValue.from(v)));
         MessageCreateParams.Builder params = MessageCreateParams.builder()
@@ -154,7 +166,7 @@ public final class ClaudeAiHelper implements AiHelper {
                 .maxTokens(4000L)
                 .system(system)
                 .outputConfig(BetaOutputConfig.builder()
-                        .effort(BetaOutputConfig.Effort.LOW)
+                        .effort(effort)
                         .format(BetaJsonOutputFormat.builder().schema(sb.build()).build())
                         .build())
                 .addUserMessage(user);
@@ -165,6 +177,6 @@ public final class ClaudeAiHelper implements AiHelper {
             throw new IllegalStateException("stop reason " + stop);
         String text = resp.content().stream().flatMap(b -> b.text().stream()).map(t -> t.text())
                 .findFirst().orElseThrow(() -> new IllegalStateException("no text in reply"));
-        return JSON.readTree(text);
+        return new Reply(JSON.readTree(text), Usage.of(resp));
     }
 }

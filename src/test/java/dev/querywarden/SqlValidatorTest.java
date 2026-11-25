@@ -93,6 +93,43 @@ class SqlValidatorTest {
     }
 
     @Test
+    void allowsOneCteReadingAnother() throws Exception {
+        // Found by the evaluation: this valid query was rejected with "Table 'rev' is not accessible".
+        validator.validate("""
+                WITH rev AS (SELECT c.country, p.category, SUM(oi.quantity * oi.unit_price) AS revenue
+                             FROM order_items oi JOIN orders o ON o.id = oi.order_id
+                             JOIN customers c ON c.id = o.customer_id JOIN products p ON p.id = oi.product_id
+                             GROUP BY c.country, p.category),
+                     ranked AS (SELECT country, category, revenue,
+                                       RANK() OVER (PARTITION BY country ORDER BY revenue DESC) AS r FROM rev)
+                SELECT country, category FROM ranked WHERE r = 1""");
+    }
+
+    @Test
+    void joinsInsideCtesAreCountedOnce() throws Exception {
+        // 4 joins in total: allowed. (They used to be counted twice, so this was rejected as 8.)
+        validator.validate("""
+                WITH t AS (SELECT o.id FROM orders o JOIN order_items oi ON oi.order_id = o.id
+                           JOIN products p ON p.id = oi.product_id JOIN customers c ON c.id = o.customer_id
+                           JOIN customers c2 ON c2.id = o.customer_id)
+                SELECT COUNT(*) FROM t""");
+        assertEquals("TOO_COMPLEX", assertThrows(SqlValidator.ValidationException.class, () -> validator.validate("""
+                WITH t AS (SELECT o.id FROM orders o JOIN order_items oi ON oi.order_id = o.id
+                           JOIN products p ON p.id = oi.product_id JOIN customers c ON c.id = o.customer_id
+                           JOIN customers c2 ON c2.id = o.customer_id JOIN customers c3 ON c3.id = o.customer_id)
+                SELECT COUNT(*) FROM t""")).code(), "5 joins is still over the limit of 4");
+    }
+
+    @Test
+    void cteNamesCannotHideRestrictedTables() {
+        // A CTE named like a restricted table is fine, but reading the real one inside it is not.
+        assertEquals("TABLE_NOT_ALLOWED", assertThrows(SqlValidator.ValidationException.class, () -> validator.validate(
+                "WITH x AS (SELECT secret FROM api_keys) SELECT * FROM x")).code());
+        assertEquals("COLUMN_NOT_ALLOWED", assertThrows(SqlValidator.ValidationException.class, () -> validator.validate(
+                "WITH a AS (SELECT name, salary FROM employees), b AS (SELECT * FROM a) SELECT name FROM b")).code());
+    }
+
+    @Test
     void wrapsSetOperations() throws Exception {
         var vq = validator.validate("SELECT name FROM customers UNION SELECT name FROM products");
         assertTrue(vq.sql().startsWith("SELECT * FROM (") && vq.sql().endsWith("LIMIT " + policy.maxRows()), vq.sql());

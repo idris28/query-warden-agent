@@ -4,7 +4,16 @@ package dev.querywarden;
 public interface SqlGenerator {
 
     /** What the model returns for each turn (structured output). */
-    record Output(boolean answerable, String sql, String explanation, String reason) {}
+    /** One model turn. {@code usage} is the tokens and cost of that call ({@link Usage#NONE} if unknown). */
+    record Output(boolean answerable, String sql, String explanation, String reason, Usage usage) {
+        public Output {
+            if (usage == null) usage = Usage.NONE;
+        }
+
+        public Output(boolean answerable, String sql, String explanation, String reason) {
+            this(answerable, sql, explanation, reason, Usage.NONE);
+        }
+    }
 
     /**
      * The SQL writer failed (network, authentication, rate limit, …). {@link #userMessage()} is safe

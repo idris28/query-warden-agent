@@ -81,6 +81,13 @@ public final class SqlValidator {
                     "Only SELECT queries are allowed (got " + list.get(0).getClass().getSimpleName() + ").");
 
         Inspector inspector = new Inspector();
+        // Register the top-level WITH names first: one CTE may read another (WITH a AS (…), b AS (… FROM a …)),
+        // and the walk can reach that reference before the WITH list itself.
+        if (select.getWithItemsList() != null) {
+            for (WithItem<?> w : select.getWithItemsList()) {
+                if (w.getAlias() != null) inspector.cteNames.add(Policy.norm(w.getAlias().getName()));
+            }
+        }
         inspector.getTables((Statement) select);
         inspector.rethrow();
 
@@ -194,6 +201,8 @@ public final class SqlValidator {
         final Set<String> stars = new HashSet<>();
         int joins;
         int selects;
+        /** The walk can reach the same CTE body twice; count each SELECT block only once. */
+        final Set<PlainSelect> counted = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         ValidationException error;
 
         Inspector() {
@@ -220,11 +229,12 @@ public final class SqlValidator {
 
         @Override
         public <S> Void visit(PlainSelect ps, S context) {
-            selects++;
+            boolean first = counted.add(ps);
+            if (first) selects++;
             checkSelect(ps);
             if (ps.getIntoTables() != null && !ps.getIntoTables().isEmpty())
                 fail("NOT_READ_ONLY", "SELECT INTO is not allowed.");
-            if (ps.getJoins() != null) joins += ps.getJoins().size();
+            if (first && ps.getJoins() != null) joins += ps.getJoins().size();
             // `*` / `t.*` as a select item (COUNT(*) is a function argument, not a select item).
             if (ps.getSelectItems() != null) {
                 for (var item : ps.getSelectItems()) {

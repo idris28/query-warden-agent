@@ -116,6 +116,7 @@ public final class WebServer {
             config.routes.before(this::guard);
             config.routes.get("/api/health", this::health);
             config.routes.get("/api/schema", this::schema);
+            config.routes.get("/api/settings", this::settings);
             config.routes.post("/api/ask", this::ask);
             config.routes.post("/api/ask/stream", this::askStream);
             config.routes.exception(Exception.class, (e, ctx) -> {
@@ -308,6 +309,7 @@ public final class WebServer {
                         "text", share ? "Claude is summarising the result" : "Claude is suggesting follow-up questions"));
                 AiHelper.Insight insight = ai.describe(Database.formatSchema(schema.get()), question, r.sql(),
                         r.result().columns(), share ? r.result().rows() : null);
+                agent.auditHelperCall(question, "web " + client, insight.usage());
                 send.accept(Map.of("type", "insights", "summary", insight.summary(), "follow_ups", insight.followUps()));
             }
             send.accept(Map.of("type", "done"));
@@ -316,6 +318,73 @@ public final class WebServer {
         } finally {
             inFlight.release();
         }
+    }
+
+    // ------------------------------------------------------------------ read-only settings
+    private volatile String policySource = "not given";
+    private volatile ModelSettings models = ModelSettings.defaults();
+    private volatile boolean fallbacksRequested = true;
+
+    /** What the settings panel shows about where the policy came from and which models answer. */
+    public WebServer withInfo(String policySource, ModelSettings models, boolean fallbacksRequested) {
+        this.policySource = policySource;
+        this.models = models;
+        this.fallbacksRequested = fallbacksRequested;
+        return this;
+    }
+
+    /**
+     * The settings in effect, for the page's read-only Settings panel. Never includes secrets (API key,
+     * database passwords or URL). Blocked columns are counted, not named: their names are kept out of
+     * the page just as they are kept out of what Claude sees.
+     */
+    private void settings(Context ctx) {
+        List<Map<String, Object>> blocked = new ArrayList<>();
+        policy.blockedColumns().entrySet().stream().sorted(Map.Entry.comparingByKey())
+                .filter(e -> !e.getValue().isEmpty() && policy.tableAllowed(e.getKey()))
+                .forEach(e -> blocked.add(Map.of("table", e.getKey(), "count", e.getValue().size())));
+
+        Map<String, Object> limits = new LinkedHashMap<>();
+        limits.put("max_rows", policy.maxRows());
+        limits.put("timeout_ms", policy.timeoutMillis());
+        limits.put("max_joins", policy.maxJoins());
+        limits.put("max_selects", policy.maxSelects());
+        limits.put("max_question_chars", policy.maxQuestionChars());
+        limits.put("max_sql_chars", policy.maxSqlChars());
+
+        Map<String, Object> pol = new LinkedHashMap<>();
+        pol.put("source", policySource);
+        pol.put("schema", policy.schema());
+        pol.put("allowed_tables", policy.allowedTables().stream().sorted().toList());
+        pol.put("blocked_columns", blocked);
+        pol.put("masked_columns", policy.maskedColumns().stream().sorted().toList());
+        pol.put("blocked_functions", policy.blockedFunctions().size());
+        pol.put("limits", limits);
+        pol.put("examples_source", examples.source());
+        pol.put("share_results_with_ai", policy.shareResultsWithAi());
+
+        Map<String, Object> ai = new LinkedHashMap<>();
+        ai.put("sql_model", models.sqlModel());
+        ai.put("sql_effort", models.sqlEffort());
+        ai.put("helper_model", models.helperModel());
+        ai.put("helper_effort", models.helperEffort());
+        ai.put("helper_enabled", this.ai != AiHelper.NONE);
+        ai.put("refusal_fallback_sql", fallbacksRequested && ModelSettings.supportsServerFallback(models.sqlModel()));
+        ai.put("refusal_fallback_helper", fallbacksRequested && ModelSettings.supportsServerFallback(models.helperModel()));
+
+        Map<String, Object> web = new LinkedHashMap<>();
+        web.put("address", options.host() + ":" + boundPort);
+        web.put("local_only", true);
+        web.put("questions_per_minute", options.perClientPerMinute());
+        web.put("questions_at_once", options.maxInFlight());
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("policy", pol);
+        out.put("models", ai);
+        out.put("web", web);
+        out.put("how_to_change", "Edit policy.yaml (rules) or the QW_* environment variables (models), then restart "
+                + "`querywarden serve`. Settings can't be changed from the page.");
+        json(ctx, 200, out);
     }
 
     /** Sliding one-minute window per client. */

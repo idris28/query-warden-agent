@@ -308,23 +308,36 @@ td.null { color: var(--muted); font-style: italic; }
 }
 .warnings li::before { content: "Note: "; font-weight: 600; color: var(--brass-strong); }
 
+/* How this was answered: right under the summary. The explanation is always visible; the SQL is
+   one click away and remembers whether you like it open. */
 .how {
-  margin-top: 2rem;
-  border-top: 1px solid var(--rule);
-  padding-top: 0.75rem;
+  margin: 0 0 1.75rem;
+  padding-left: 1rem;
+  border-left: 2px solid var(--rule);
+  max-width: 65ch;
 }
-.how summary { cursor: pointer; font-weight: 600; padding: 0.25rem 0; }
-.how p { max-width: 65ch; }
+.how-explanation { margin: 0 0 0.35rem; color: var(--muted); }
+.how-corrected { margin: 0 0 0.35rem; color: var(--brass-strong); font-size: var(--step--1); }
+.how summary {
+  cursor: pointer;
+  font-size: var(--step--1);
+  font-weight: 600;
+  color: var(--teal);
+  padding: 0.15rem 0;
+  width: fit-content;
+}
+.how summary:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
 .how pre {
   background: var(--code-bg);
   padding: 1rem;
+  margin: 0.5rem 0 0;
   overflow-x: auto;
   border-radius: 4px;
   font: var(--step--1)/1.5 var(--mono);
   white-space: pre-wrap;
   word-break: break-word;
 }
-.how ul { padding-left: 1.2rem; }
+.how ul { padding-left: 1.2rem; font-size: var(--step--1); }
 .how li { margin-bottom: 0.6rem; }
 .how li code { font: var(--step--1)/1.4 var(--mono); display: block; margin-top: 0.2rem; color: var(--muted); }
 
@@ -438,3 +451,35 @@ th[aria-sort="descending"] button.sort::after { content: " ↓"; }
 .next button:hover { text-decoration-color: currentColor; }
 .next button:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
 .chart.is-tall { height: 32rem; }
+
+/* ---------------------------------------------------------------- settings (read-only) */
+.settings {
+  width: min(40rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 4rem);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 1.5rem 1.75rem;
+  background: var(--paper);
+  color: var(--ink);
+}
+.settings::backdrop { background: color-mix(in srgb, var(--ink) 35%, transparent); }
+.settings-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.settings h2 { font: 600 var(--step-2)/1.2 var(--serif); margin: 0; }
+.settings h3 {
+  font: 600 var(--step-0)/1.3 var(--sans);
+  margin: 1.5rem 0 0.5rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--rule);
+}
+.settings dl {
+  display: grid;
+  grid-template-columns: minmax(9rem, 13rem) 1fr;
+  gap: 0.45rem 1.25rem;
+  margin: 0;
+  font-size: var(--step--1);
+}
+.settings dt { color: var(--muted); }
+.settings dd { margin: 0; }
+.settings .is-on { color: var(--brass-strong); font-weight: 600; }
+.settings-how { margin-top: 1.5rem; font-size: var(--step--1); color: var(--muted); }
+@media (max-width: 560px) { .settings dl { grid-template-columns: 1fr; } .settings dd { margin-bottom: 0.4rem; } }

@@ -13,8 +13,16 @@ import java.util.List;
 public interface AiHelper {
 
     /** A one-sentence summary (empty when results weren't shared) and suggested next questions. */
-    record Insight(String summary, List<String> followUps) {
-        public static final Insight NONE = new Insight("", List.of());
+    record Insight(String summary, List<String> followUps, Usage usage) {
+        public static final Insight NONE = new Insight("", List.of(), Usage.NONE);
+
+        public Insight {
+            if (usage == null) usage = Usage.NONE;
+        }
+
+        public Insight(String summary, List<String> followUps) {
+            this(summary, followUps, Usage.NONE);
+        }
     }
 
     /** Example questions that fit the schema the agent can see. */

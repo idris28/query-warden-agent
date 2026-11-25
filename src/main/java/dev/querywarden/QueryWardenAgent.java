@@ -54,8 +54,18 @@ public final class QueryWardenAgent {
     /** A step the agent has reached, for live progress on the web page. */
     public record Progress(String stage, String text) {}
 
+    /**
+     * The outcome of one question. {@code usage} adds up every Claude call made for it (including
+     * rejected attempts); {@code errorDetail} is the internal reason for a FAILED status (never shown
+     * to users; audit log and evals only).
+     */
     public record Result(String question, Status status, String message, String sql, String explanation,
-                         SafeExecutor.QueryResult result, List<Attempt> attempts, List<String> warnings) {}
+                         SafeExecutor.QueryResult result, List<Attempt> attempts, List<String> warnings,
+                         Usage usage, String errorDetail) {
+        Result with(Usage u, String detail) {
+            return new Result(question, status, message, sql, explanation, result, attempts, warnings, u, detail);
+        }
+    }
 
     private final Policy policy;
     private final SqlGenerator generator;
@@ -122,35 +132,39 @@ public final class QueryWardenAgent {
         java.util.function.Consumer<Progress> safe = p -> {
             try { progress.accept(p); } catch (RuntimeException ignored) { }
         };
+        Usage[] usage = {Usage.NONE};
         try {
-            res = run(question, attempts, safe);
+            res = run(question, attempts, safe, u -> usage[0] = usage[0].plus(u));
         } catch (SqlGenerator.GeneratorException e) {
             errorDetail = e.getMessage();
-            res = new Result(question, Status.FAILED, e.userMessage(), "", "", null, attempts, List.of());
+            res = new Result(question, Status.FAILED, e.userMessage(), "", "", null, attempts, List.of(), Usage.NONE, null);
         } catch (RuntimeException e) {
             errorDetail = e.getClass().getSimpleName() + ": " + e.getMessage();
             res = new Result(question, Status.FAILED, "Something went wrong. Details are in the audit log.",
-                    "", "", null, attempts, List.of());
+                    "", "", null, attempts, List.of(), Usage.NONE, null);
         }
-        audit(res, client, (System.nanoTime() - start) / 1_000_000, errorDetail);
+        res = res.with(usage[0], errorDetail);
+        audit(res, client, (System.nanoTime() - start) / 1_000_000);
         return res;
     }
 
-    private Result run(String question, List<Attempt> attempts, java.util.function.Consumer<Progress> progress) {
+    private Result run(String question, List<Attempt> attempts, java.util.function.Consumer<Progress> progress,
+                       java.util.function.Consumer<Usage> usage) {
         String blocked = checkInput(question);
-        if (blocked != null) return new Result(question, Status.BLOCKED, blocked, "", "", null, attempts, List.of());
+        if (blocked != null) return new Result(question, Status.BLOCKED, blocked, "", "", null, attempts, List.of(), Usage.NONE, null);
 
         SqlGenerator.Conversation convo = generator.open(systemPrompt);
         String next = "<question>" + question + "</question>";
         for (int i = 0; i < maxAttempts; i++) {
             progress.accept(new Progress("writing", i == 0 ? "Claude is writing the SQL" : "Claude is correcting the query"));
             SqlGenerator.Output out = convo.send(next);
+            usage.accept(out.usage());
             String sql = out.sql() == null ? "" : out.sql().strip();
             if (!out.answerable() || sql.isEmpty()) {
                 attempts.add(new Attempt(sql, "unanswerable", out.reason(), ""));
                 String msg = out.reason() == null || out.reason().isBlank()
                         ? "The question can't be answered from the available data." : out.reason();
-                return new Result(question, Status.UNANSWERABLE, msg, "", "", null, attempts, List.of());
+                return new Result(question, Status.UNANSWERABLE, msg, "", "", null, attempts, List.of(), Usage.NONE, null);
             }
             SqlValidator.ValidatedQuery vq;
             SafeExecutor.QueryResult qr;
@@ -172,14 +186,14 @@ public final class QueryWardenAgent {
             List<String> warnings = new ArrayList<>(vq.warnings());
             if (qr.truncated()) warnings.add("Result truncated to " + policy.maxRows() + " rows.");
             if (qr.redactions() > 0) warnings.add(qr.redactions() + " sensitive value(s) redacted.");
-            return new Result(question, Status.OK, "", vq.sql(), out.explanation(), qr, attempts, warnings);
+            return new Result(question, Status.OK, "", vq.sql(), out.explanation(), qr, attempts, warnings, Usage.NONE, null);
         }
         return new Result(question, Status.FAILED,
-                "Could not produce a safe, valid query after " + maxAttempts + " attempts.", "", "", null, attempts, List.of());
+                "Could not produce a safe, valid query after " + maxAttempts + " attempts.", "", "", null, attempts, List.of(), Usage.NONE, null);
     }
 
     /** Synchronized so that questions finishing at the same moment never interleave their lines. */
-    private synchronized void audit(Result r, String client, long elapsedMillis, String errorDetail) {
+    private synchronized void audit(Result r, String client, long elapsedMillis) {
         if (auditLog == null) return;
         Map<String, Object> e = new LinkedHashMap<>();
         e.put("ts", Instant.now().toString());
@@ -191,7 +205,27 @@ public final class QueryWardenAgent {
         e.put("sql", r.sql());
         e.put("attempts", r.attempts());
         e.put("rows", r.result() == null ? 0 : r.result().rows().size());
-        if (errorDetail != null) e.put("error", errorDetail);
+        e.put("usage", r.usage().toMap());
+        if (r.errorDetail() != null) e.put("error", r.errorDetail());
+        write(e);
+    }
+
+    /**
+     * Records the tokens and cost of an extra Claude call made for a question outside the main loop
+     * (the web page's summary and follow-ups), so the audit log shows the full cost of each answer.
+     */
+    public synchronized void auditHelperCall(String question, String client, Usage usage) {
+        if (auditLog == null || usage == null || usage.calls() == 0) return;
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("ts", Instant.now().toString());
+        e.put("kind", "helper");
+        e.put("client", client);
+        e.put("question", question);
+        e.put("usage", usage.toMap());
+        write(e);
+    }
+
+    private void write(Map<String, Object> e) {
         try {
             Files.writeString(auditLog, JSON.writeValueAsString(e) + "\n",
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);

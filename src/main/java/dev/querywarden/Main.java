@@ -38,19 +38,29 @@ public final class Main {
         }
         String cmd = args.isEmpty() ? "help" : args.remove(0);
         String rest = String.join(" ", args);
-        if (!List.of("setup", "schema", "check", "ask", "repl", "policy", "serve").contains(cmd)) {
+        if (!List.of("setup", "schema", "check", "ask", "repl", "policy", "serve", "eval").contains(cmd)) {
             System.out.println(USAGE);
             return;
         }
 
         Database.Config cfg = Database.Config.fromEnv();
         Policy policy;
+        String policySource;
         try {
             Policy.Loaded loaded = Policy.resolve(policyPath);
             policy = loaded.policy();
-            System.err.println("policy: " + loaded.source());
+            policySource = loaded.source();
+            System.err.println("policy: " + policySource);
         } catch (Policy.PolicyException e) {
             System.err.println("Invalid policy: " + e.getMessage());
+            System.exit(4);
+            return;
+        }
+        ModelSettings models;
+        try {
+            models = ModelSettings.fromEnv();
+        } catch (IllegalArgumentException e) {
+            System.err.println("Invalid model setting: " + e.getMessage());
             System.exit(4);
             return;
         }
@@ -85,19 +95,26 @@ public final class Main {
                     opts = opts.withPort(Integer.parseInt(parts[1]));
                 }
                 com.zaxxer.hikari.HikariDataSource pool = cfg.agentPool(opts.maxInFlight() + 1);
-                QueryWardenAgent agent = new QueryWardenAgent(cfg, pool, policy, new ClaudeSqlGenerator(fallbacks),
+                QueryWardenAgent agent = new QueryWardenAgent(cfg, pool, policy, new ClaudeSqlGenerator(models, fallbacks),
                         3, Path.of("audit.jsonl"));
                 List<Database.TableInfo> tables = Database.schemaInfo(cfg, policy);
-                AiHelper ai = new ClaudeAiHelper(fallbacks);
+                AiHelper ai = new ClaudeAiHelper(models, fallbacks);
+                System.out.println("Models: SQL " + models.sqlModel() + " (" + models.sqlEffort() + " effort), helper "
+                        + models.helperModel() + " (" + models.helperEffort() + " effort)");
                 if (policy.examples().isEmpty()) System.out.println("No examples in the policy; asking Claude to suggest some…");
                 WebServer.Examples examples = WebServer.resolveExamples(policy, ai, Database.formatSchema(tables));
                 System.out.println("Example questions: " + examples.questions().size() + " (from " + examples.source() + ")");
                 System.out.println("Result summaries: " + (policy.shareResultsWithAi()
                         ? "on (up to 50 masked result rows are sent to Claude per answer)"
                         : "off (results stay on this computer; Claude only suggests follow-ups)"));
-                new WebServer(agent, policy, pool, () -> tables, ai, examples, opts).start();
+                new WebServer(agent, policy, pool, () -> tables, ai, examples, opts)
+                        .withInfo(policySource, models, fallbacks).start();
                 System.out.println("QueryWarden is running at http://localhost:" + opts.port()
                         + "  (only reachable from this computer; Ctrl-C to stop)");
+            }
+            case "eval" -> {
+                dev.querywarden.eval.EvalRunner.main(args.toArray(String[]::new), cfg, policy, models, fallbacks);
+                System.exit(0);   // don't wait for idle HTTP client threads
             }
             case "repl" -> {
                 QueryWardenAgent agent = agent(cfg, policy, fallbacks);
@@ -117,11 +134,13 @@ public final class Main {
     private static final String USAGE = """
             usage: querywarden <setup|schema|policy|ask|repl|check|serve> [text] [--policy FILE] [--no-fallbacks]
                    querywarden serve [--port N]    web page at http://localhost:8080
+                   querywarden eval --check | --self-test | --variant NAME [--reps N] | --compare
             env:   QW_DB_URL, QW_ADMIN_USER, QW_ADMIN_PASSWORD, QW_AGENT_USER, QW_AGENT_PASSWORD,
                    QW_POLICY, ANTHROPIC_API_KEY""";
 
     private static QueryWardenAgent agent(Database.Config cfg, Policy policy, boolean fallbacks) throws Exception {
-        return new QueryWardenAgent(cfg, policy, new ClaudeSqlGenerator(fallbacks), 3, Path.of("audit.jsonl"));
+        return new QueryWardenAgent(cfg, policy, new ClaudeSqlGenerator(ModelSettings.fromEnv(), fallbacks), 3,
+                Path.of("audit.jsonl"));
     }
 
     private static int check(Database.Config cfg, Policy policy, String sql) {

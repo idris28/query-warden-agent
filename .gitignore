@@ -2,3 +2,7 @@ target/
 audit.jsonl
 .DS_Store
 .vscode/
+# evaluation output: keep results, skip bulky or regenerated files
+.claude/hillclimb/**/traces/
+.claude/hillclimb/**/report.html
+.claude/hillclimb/**/trajectory/

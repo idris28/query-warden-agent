@@ -25,6 +25,10 @@
         <h2 id="data-heading">Data you can ask about</h2>
         <div id="tables" class="tables"><p class="quiet">Loading…</p></div>
       </section>
+
+      <section class="side-block">
+        <button id="settings-open" class="secondary" type="button">Settings</button>
+      </section>
     </aside>
 
     <main class="main">
@@ -51,6 +55,19 @@
         <p id="answer-summary" class="answer-summary"></p>
         <p id="answer-insight" class="answer-insight" hidden></p>
         <p id="answer-message" class="answer-message" hidden></p>
+
+        <section id="how" class="how" hidden aria-label="How this was answered">
+          <p id="how-explanation" class="how-explanation"></p>
+          <p id="how-corrected" class="how-corrected" hidden></p>
+          <details id="how-details">
+            <summary>SQL that was run</summary>
+            <pre><code id="how-sql"></code></pre>
+            <div id="how-rejected" hidden>
+              <p>Earlier queries that QueryWarden rejected and Claude corrected:</p>
+              <ul id="how-rejected-list"></ul>
+            </div>
+          </details>
+        </section>
 
         <div id="chart-controls" class="chart-controls" hidden>
           <div class="segmented" role="group" aria-label="Show as">
@@ -87,17 +104,18 @@
           <ul id="next-list"></ul>
         </section>
 
-        <details id="how" class="how" hidden>
-          <summary>How this was answered</summary>
-          <p id="how-explanation"></p>
-          <pre><code id="how-sql"></code></pre>
-          <div id="how-rejected" hidden>
-            <p>Earlier attempts that QueryWarden rejected and Claude corrected:</p>
-            <ul id="how-rejected-list"></ul>
-          </div>
-        </details>
       </article>
     </main>
   </div>
+
+  <dialog id="settings" class="settings" aria-labelledby="settings-heading">
+    <div class="settings-head">
+      <h2 id="settings-heading">Settings</h2>
+      <button id="settings-close" class="secondary" type="button">Close</button>
+    </div>
+    <p class="quiet">Read-only. These come from policy.yaml and the server's environment.</p>
+    <div id="settings-body"><p class="quiet">Loading…</p></div>
+    <p id="settings-how" class="settings-how"></p>
+  </dialog>
 </body>
 </html>

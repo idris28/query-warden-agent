@@ -449,6 +449,41 @@ class WebServerTest {
     }
 
     @Test
+    void settingsAreReadOnlyAndHideSecrets() throws Exception {
+        var agent = new QueryWardenAgent(cfg, pool, POLICY, byKeyword(), 3, null);
+        var models = ModelSettings.fromMap(java.util.Map.of("QW_SQL_EFFORT", "high"));
+        app = new WebServer(agent, POLICY, pool, () -> tables, new FakeAi(),
+                new WebServer.Examples(List.of("q"), "policy"), new WebServer.Options("127.0.0.1", 0, 4, 10))
+                .withInfo("policy.yaml", models, true).start();
+        int port = app.port();
+
+        var r = get(port, "/api/settings");
+        assertEquals(200, r.statusCode());
+        JsonNode s = JSON.readTree(r.body());
+        assertEquals("claude-opus-5-5", s.get("models").get("sql_model").asText());
+        assertEquals("high", s.get("models").get("sql_effort").asText());
+        assertEquals("claude-haiku-5-5", s.get("models").get("helper_model").asText());
+        assertTrue(s.get("models").get("refusal_fallback_sql").asBoolean());
+        assertFalse(s.get("models").get("refusal_fallback_helper").asBoolean(), "Haiku has no server-side fallback");
+        assertEquals("policy.yaml", s.get("policy").get("source").asText());
+        assertEquals("employees", s.get("policy").get("blocked_columns").get(0).get("table").asText());
+        assertEquals(2, s.get("policy").get("blocked_columns").get(0).get("count").asInt());
+        assertEquals(10, s.get("web").get("questions_per_minute").asInt());
+
+        String body = r.body();
+        for (String secret : List.of("salary", "ssn", "api_keys", "agent_test_pw", "postgres", "jdbc:", "sk-ant")) {
+            assertFalse(body.contains(secret), "settings must not reveal '" + secret + "': " + body);
+        }
+
+        // There is no way to change settings from the page.
+        var write = http.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/settings"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString("{\"share_results_with_ai\":true}")).build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertTrue(write.statusCode() == 404 || write.statusCode() == 405, "got " + write.statusCode());
+    }
+
+    @Test
     void errorsNeverLeakInternals() throws Exception {
         SqlGenerator crashing = system -> text -> { throw new IllegalStateException("internal-secret-detail"); };
         int port = start(crashing, new WebServer.Options("127.0.0.1", 0, 4, 100));
