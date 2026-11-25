@@ -36,7 +36,9 @@ public record Policy(
         int maxSqlChars,
         Set<String> blockedFunctions,
         List<String> examples,
-        boolean shareResultsWithAi) {
+        boolean shareResultsWithAi,
+        Map<String, String> definitions,
+        boolean shareCategoryValues) {
 
     /** Dangerous PostgreSQL functions. Always blocked; a policy file can only add to this list. */
     public static final Set<String> BUILT_IN_BLOCKED_FUNCTIONS = Set.of(
@@ -67,10 +69,22 @@ public record Policy(
                 4000,
                 BUILT_IN_BLOCKED_FUNCTIONS,
                 List.of(),     // no examples: the web page asks Claude to suggest some
-                false);        // result rows never leave this machine unless the policy says so
+                false,         // result rows never leave this machine unless the policy says so
+                Map.of(),      // no business definitions
+                false);        // category values (e.g. country codes) aren't sent to Claude unless the policy says so
     }
 
     public static final int MAX_EXAMPLES = 12;
+    public static final int MAX_DEFINITIONS = 40;
+    public static final int MAX_TERM_CHARS = 60;
+    public static final int MAX_DEFINITION_CHARS = 400;
+
+    /** The definitions as prompt text ("- term: meaning" lines), or "" when there are none. */
+    public String definitionsText() {
+        StringBuilder sb = new StringBuilder();
+        definitions.forEach((t, m) -> sb.append("- ").append(t).append(": ").append(m).append('\n'));
+        return sb.toString().strip();
+    }
     public static final int MAX_EXAMPLE_CHARS = 200;
 
     // ------------------------------------------------------------------ loading from YAML
@@ -83,13 +97,14 @@ public record Policy(
     }
 
     /** A policy plus a description of where it came from (shown to the user). */
-    public record Loaded(Policy policy, String source) {}
+    /** {@code path} is the file that was read, or null for the built-in defaults. */
+    public record Loaded(Policy policy, String source, Path path) {}
 
     public static final String DEFAULT_FILE = "policy.yaml";
 
     private static final Set<String> TOP_KEYS = Set.of(
             "schema", "allowed_tables", "blocked_columns", "masked_columns", "blocked_functions", "limits",
-            "examples", "share_results_with_ai");
+            "examples", "share_results_with_ai", "definitions", "share_category_values");
     private static final Set<String> LIMIT_KEYS = Set.of(
             "max_rows", "timeout_ms", "max_joins", "max_selects", "max_question_chars", "max_sql_chars");
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_$]*");
@@ -101,12 +116,12 @@ public record Policy(
      * A path given explicitly (flag or variable) must exist.
      */
     public static Loaded resolve(String cliPath) throws PolicyException {
-        if (cliPath != null && !cliPath.isBlank()) return new Loaded(load(Path.of(cliPath)), cliPath);
+        if (cliPath != null && !cliPath.isBlank()) return new Loaded(load(Path.of(cliPath)), cliPath, Path.of(cliPath));
         String env = System.getenv("QW_POLICY");
-        if (env != null && !env.isBlank()) return new Loaded(load(Path.of(env)), env + " (from QW_POLICY)");
+        if (env != null && !env.isBlank()) return new Loaded(load(Path.of(env)), env + " (from QW_POLICY)", Path.of(env));
         Path local = Path.of(DEFAULT_FILE);
-        if (Files.isRegularFile(local)) return new Loaded(load(local), DEFAULT_FILE);
-        return new Loaded(defaults(), "built-in defaults (no " + DEFAULT_FILE + " found)");
+        if (Files.isRegularFile(local)) return new Loaded(load(local), DEFAULT_FILE, local);
+        return new Loaded(defaults(), "built-in defaults (no " + DEFAULT_FILE + " found)", null);
     }
 
     /** Reads and validates a YAML policy file. Keys that are left out keep their default values. */
@@ -177,6 +192,34 @@ public record Policy(
                 throw new PolicyException(origin + ": examples: at most " + MAX_EXAMPLES + " questions (got " + list.size() + ").");
             examples = List.copyOf(list);
         }
+        Map<String, String> definitions = d.definitions();
+        if (root.has("definitions") && !root.get("definitions").isNull()) {
+            JsonNode defs = root.get("definitions");
+            if (!defs.isObject())
+                throw new PolicyException(origin + ": definitions must map a term to its meaning, e.g. revenue: \"…\".");
+            Map<String, String> m = new LinkedHashMap<>();
+            for (Iterator<Map.Entry<String, JsonNode>> it = defs.fields(); it.hasNext(); ) {
+                var e = it.next();
+                String term = e.getKey().strip();
+                if (term.isEmpty() || term.length() > MAX_TERM_CHARS)
+                    throw new PolicyException(origin + ": definitions: term '" + term + "' must be 1–" + MAX_TERM_CHARS + " characters.");
+                if (!e.getValue().isTextual() || e.getValue().asText().isBlank())
+                    throw new PolicyException(origin + ": definitions." + term + " must be a sentence describing it.");
+                String meaning = e.getValue().asText().strip();
+                if (meaning.length() > MAX_DEFINITION_CHARS)
+                    throw new PolicyException(origin + ": definitions." + term + " is longer than " + MAX_DEFINITION_CHARS + " characters.");
+                m.put(term, meaning);
+            }
+            if (m.size() > MAX_DEFINITIONS)
+                throw new PolicyException(origin + ": definitions: at most " + MAX_DEFINITIONS + " terms (got " + m.size() + ").");
+            definitions = java.util.Collections.unmodifiableMap(m);
+        }
+        boolean categories = d.shareCategoryValues();
+        if (root.has("share_category_values") && !root.get("share_category_values").isNull()) {
+            JsonNode cv = root.get("share_category_values");
+            if (!cv.isBoolean()) throw new PolicyException(origin + ": share_category_values must be true or false.");
+            categories = cv.asBoolean();
+        }
         boolean share = d.shareResultsWithAi();
         if (root.has("share_results_with_ai") && !root.get("share_results_with_ai").isNull()) {
             JsonNode sh = root.get("share_results_with_ai");
@@ -199,7 +242,9 @@ public record Policy(
                 limit(limits, "max_sql_chars", d.maxSqlChars(), 100, 100_000, origin),
                 Set.copyOf(functions),
                 examples,
-                share);
+                share,
+                definitions,
+                categories);
     }
 
     private static void checkKeys(JsonNode node, Set<String> known, String origin, String prefix) throws PolicyException {
@@ -267,6 +312,12 @@ public record Policy(
             throw new IllegalStateException(e);
         }
         sb.append("share_results_with_ai: ").append(shareResultsWithAi).append('\n');
+        sb.append("share_category_values: ").append(shareCategoryValues).append('\n');
+        try {
+            sb.append("definitions: ").append(new ObjectMapper().writeValueAsString(definitions)).append('\n');
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
         sb.append("limits:\n");
         sb.append("  max_rows: ").append(maxRows).append('\n');
         sb.append("  timeout_ms: ").append(timeoutMillis).append('\n');
@@ -305,12 +356,12 @@ public record Policy(
 
     public Policy withMaxRows(int rows) {
         return new Policy(schema, allowedTables, blockedColumns, maskedColumns, rows, timeoutMillis,
-                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi);
+                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi, definitions, shareCategoryValues);
     }
 
     public Policy withTimeoutMillis(int ms) {
         return new Policy(schema, allowedTables, blockedColumns, maskedColumns, maxRows, ms,
-                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi);
+                maxJoins, maxSelects, maxQuestionChars, maxSqlChars, blockedFunctions, examples, shareResultsWithAi, definitions, shareCategoryValues);
     }
 
     static String norm(String s) {

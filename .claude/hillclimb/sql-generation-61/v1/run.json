@@ -1,0 +1,10 @@
+{
+  "variant" : "v1",
+  "sql_model" : "claude-opus-5-5",
+  "sql_effort" : "medium",
+  "reps" : 2,
+  "cases" : 61,
+  "started" : "2026-11-25T15:39:03.429136Z",
+  "wall_clock_s" : 105.21,
+  "finished" : "2026-11-25T15:40:48.854251Z"
+}

@@ -44,6 +44,8 @@ import dev.querywarden.Usage;
  *   querywarden eval --self-test                grader sanity check: references vs themselves and vs empty (free)
  *   querywarden eval --variant baseline [--reps N] [--only id1,id2] [--concurrency 4]
  *   querywarden eval --compare                  side-by-side numbers for every variant run so far
+ *   querywarden eval --variant NAME --regrade   grade stored answers again after changing references (free)
+ *   (any of the above) --flow NAME              keep results in .claude/hillclimb/NAME instead
  * </pre>
  * The SQL model comes from QW_SQL_MODEL / QW_SQL_EFFORT, like the app. Output goes to
  * {@code .claude/hillclimb/sql-generation/<variant>/}: results.jsonl (one row per question and rep),
@@ -52,17 +54,23 @@ import dev.querywarden.Usage;
 public final class EvalRunner {
 
     static final ObjectMapper JSON = new ObjectMapper();
-    static final Path FLOW = Path.of(".claude/hillclimb/sql-generation");
+    /** Where results go; --flow NAME picks .claude/hillclimb/NAME (default sql-generation). */
+    static Path FLOW = Path.of(".claude/hillclimb/sql-generation");
     static final long CASE_TIMEOUT_S = 180;
 
     public record EvalCase(String id, List<String> tags, String question, String expect, boolean ordered,
-                           List<String> references) {
+                           List<String> references, List<QueryWardenAgent.Turn> history) {
         boolean decline() { return "decline".equals(expect); }
     }
 
     public static void main(String[] args, Database.Config cfg, Policy policy, ModelSettings models,
                             boolean fallbacks) throws Exception {
         Map<String, String> opt = parse(args);
+        if (opt.containsKey("flow")) {
+            String flow = opt.get("flow");
+            if (!flow.matches("[a-z0-9][a-z0-9-]{0,40}")) throw new IllegalArgumentException("--flow must be a short name like sql-generation-61");
+            FLOW = Path.of(".claude/hillclimb").resolve(flow);
+        }
         List<EvalCase> cases = load(Path.of(opt.getOrDefault("cases", "eval/cases.yaml")));
         if (opt.containsKey("only")) {
             Set<String> only = Set.of(opt.get("only").split(","));
@@ -76,9 +84,56 @@ public final class EvalRunner {
         String variant = opt.getOrDefault("variant", "baseline");
         if (!variant.matches("baseline|v\\d+"))
             throw new IllegalArgumentException("--variant must be baseline, v1, v2, …");
+        if (opt.containsKey("regrade")) { regrade(cfg, policy, cases, FLOW.resolve(variant)); return; }
         int reps = Integer.parseInt(opt.getOrDefault("reps", "1"));
         int concurrency = Integer.parseInt(opt.getOrDefault("concurrency", "4"));
         run(cfg, policy, models, fallbacks, cases, variant, reps, concurrency);
+    }
+
+    /**
+     * Grades stored answers again against the current references, without calling Claude: each
+     * answer's stored SQL is re-run (through the validator and the read-only user) on the same database.
+     * Use it after correcting or adding accepted readings. The previous file is kept as
+     * results.before-regrade.jsonl.
+     */
+    static void regrade(Database.Config cfg, Policy policy, List<EvalCase> cases, Path dir) throws Exception {
+        Path results = dir.resolve("results.jsonl");
+        Map<String, EvalCase> byId = new LinkedHashMap<>();
+        cases.forEach(c -> byId.put(c.id(), c));
+        SafeExecutor ex = new SafeExecutor(cfg, policy);
+        SafeExecutor refEx = new SafeExecutor(cfg, policy.withMaxRows(10_000));
+        dev.querywarden.SqlValidator validator = new dev.querywarden.SqlValidator(policy);
+        List<String> out = new ArrayList<>();
+        int changed = 0;
+        for (String line : Files.readAllLines(results)) {
+            if (line.isBlank()) continue;
+            var row = (com.fasterxml.jackson.databind.node.ObjectNode) JSON.readTree(line);
+            EvalCase c = byId.get(row.get("prompt_id").asText());
+            String sql = row.path("meta").path("sql").asText("");
+            boolean ok = "ok".equals(row.path("meta").path("agent_status").asText());
+            if (c != null && !c.decline() && ok && !sql.isBlank()) {
+                var rows = ex.execute(validator.validate(sql).sql()).rows();
+                var refs = references(refEx, c);
+                double correct = 0;
+                String why = "no reference matched";
+                List<String> reasons = new ArrayList<>();
+                for (int k = 0; k < refs.size(); k++) {
+                    var o = ResultMatcher.compare(rows, refs.get(k), c.ordered());
+                    if (o.match()) { correct = 1; why = (refs.size() > 1 ? "matches reading " + (k + 1) + ": " : "") + o.why(); break; }
+                    reasons.add((refs.size() > 1 ? "reading " + (k + 1) + ": " : "") + o.why());
+                }
+                if (correct == 0) why = String.join("; ", reasons);
+                if (row.path("grade").path("correct").asDouble() != correct) changed++;
+                ((com.fasterxml.jackson.databind.node.ObjectNode) row.get("grade")).put("correct", correct);
+                ((com.fasterxml.jackson.databind.node.ObjectNode) row.get("explanation")).put("correct", why);
+            }
+            out.add(JSON.writeValueAsString(row));
+        }
+        Path backup = dir.resolve("results.before-regrade.jsonl");
+        if (!Files.exists(backup)) Files.copy(results, backup);
+        Files.writeString(results, String.join("\n", out) + "\n");
+        System.out.println("Regraded " + out.size() + " answers in " + dir + ": " + changed + " grade(s) changed.");
+        Summary.print(dir);
     }
 
     // ------------------------------------------------------------------ loading
@@ -96,8 +151,11 @@ public final class EvalRunner {
             String expect = c.path("expect").asText("answer");
             if (!expect.equals("decline") && refs.isEmpty())
                 throw new IllegalArgumentException(id + ": an answer case needs at least one reference query");
+            List<QueryWardenAgent.Turn> history = new ArrayList<>();
+            c.path("history").forEach(h -> history.add(new QueryWardenAgent.Turn(h.path("question").asText(),
+                    h.path("sql").asText().strip())));
             out.add(new EvalCase(id, List.copyOf(tags), c.path("question").asText(), expect,
-                    c.path("ordered").asBoolean(false), List.copyOf(refs)));
+                    c.path("ordered").asBoolean(false), List.copyOf(refs), List.copyOf(history)));
         }
         return out;
     }
@@ -108,7 +166,7 @@ public final class EvalRunner {
             String a = args[i];
             if (!a.startsWith("--")) throw new IllegalArgumentException("unexpected argument " + a);
             String key = a.substring(2);
-            if (Set.of("check", "self-test", "compare", "list").contains(key)) m.put(key, "true");
+            if (Set.of("check", "self-test", "compare", "list", "regrade").contains(key)) m.put(key, "true");
             else if (i + 1 < args.length) m.put(key, args[++i]);
             else throw new IllegalArgumentException(a + " needs a value");
         }
@@ -156,7 +214,10 @@ public final class EvalRunner {
                     .append(" | ").append(c.decline() ? "" : c.references().size()).append(" |\n");
         }
         for (EvalCase c : cases) {
-            sb.append("\n## ").append(c.id()).append("\n\n````text\n").append(c.question()).append("\n````\n");
+            sb.append("\n## ").append(c.id()).append("\n\n");
+            for (QueryWardenAgent.Turn t : c.history())
+                sb.append("Earlier in the conversation: \"").append(t.question()).append("\"\n\n");
+            sb.append("````text\n").append(c.question()).append("\n````\n");
             for (int k = 0; k < c.references().size(); k++) {
                 sb.append("\n").append(c.references().size() > 1 ? "Acceptable reading " + (k + 1) + ":" : "Reference:")
                         .append("\n\n````sql\n").append(c.references().get(k)).append("\n````\n");
@@ -256,7 +317,7 @@ public final class EvalRunner {
             long start = System.nanoTime();
             QueryWardenAgent.Result res;
             try {
-                Future<QueryWardenAgent.Result> f = timer.submit(() -> agent.ask(c.question(), "eval"));
+                Future<QueryWardenAgent.Result> f = timer.submit(() -> agent.ask(c.question(), "eval", p -> { }, c.history()));
                 res = f.get(CASE_TIMEOUT_S, TimeUnit.SECONDS);
             } catch (TimeoutException e) {
                 error(errors, c, rep, "timeout", "no answer within " + CASE_TIMEOUT_S + " s", retries, null);
@@ -402,6 +463,10 @@ public final class EvalRunner {
 
     static void writeTrace(Path dir, EvalCase c, int rep, QueryWardenAgent.Result res) throws IOException {
         List<Map<String, Object>> turns = new ArrayList<>();
+        for (QueryWardenAgent.Turn t : c.history()) {
+            turns.add(Map.of("role", "user", "content", "(earlier) " + t.question()));
+            turns.add(Map.of("role", "assistant", "content", "(earlier SQL) " + t.sql()));
+        }
         turns.add(Map.of("role", "user", "content", c.question()));
         for (QueryWardenAgent.Attempt a : res.attempts()) {
             if (a.status().equals("unanswerable")) {
@@ -457,7 +522,7 @@ public final class EvalRunner {
         Path state = FLOW.resolve("_state.json");
         if (Files.exists(state)) return;
         Map<String, Object> s = new TreeMap<>();
-        s.put("flow", "sql-generation");
+        s.put("flow", FLOW.getFileName().toString());
         s.put("metrics", List.of(
                 Map.of("id", "correct", "label", "Correct", "kind", "binary"),
                 Map.of("id", "no_leak", "label", "No leak", "kind", "binary")));

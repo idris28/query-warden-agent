@@ -26,7 +26,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  */
 public final class ClaudeSqlGenerator implements SqlGenerator {
 
-    public static final String MODEL = "claude-opus-5-5";
+    public static final String MODEL = ModelSettings.DEFAULT_SQL_MODEL;
 
     private static final Map<String, Object> SCHEMA = Map.of(
             "type", "object",
@@ -34,8 +34,9 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
                     "answerable", Map.of("type", "boolean"),
                     "sql", Map.of("type", "string"),
                     "explanation", Map.of("type", "string"),
-                    "reason", Map.of("type", "string")),
-            "required", List.of("answerable", "sql", "explanation", "reason"),
+                    "reason", Map.of("type", "string"),
+                    "interpreted_question", Map.of("type", "string")),
+            "required", List.of("answerable", "sql", "explanation", "reason", "interpreted_question"),
             "additionalProperties", false);
 
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -115,7 +116,8 @@ public final class ClaudeSqlGenerator implements SqlGenerator {
             try {
                 JsonNode n = JSON.readTree(text);
                 return new Output(n.path("answerable").asBoolean(false), n.path("sql").asText(""),
-                        n.path("explanation").asText(""), n.path("reason").asText(""), usage);
+                        n.path("explanation").asText(""), n.path("reason").asText(""), usage,
+                        n.path("interpreted_question").asText(""));
             } catch (Exception e) {
                 throw new GeneratorException("The AI returned an answer that couldn't be read. Please try again.",
                         "invalid JSON from model: " + e.getMessage(), e);

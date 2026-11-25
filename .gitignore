@@ -6,3 +6,8 @@ audit.jsonl
 .claude/hillclimb/**/traces/
 .claude/hillclimb/**/report.html
 .claude/hillclimb/**/trajectory/
+users.json
+users.json.tmp
+.querywarden/
+feedback.jsonl
+*.verified.json.tmp

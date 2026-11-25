@@ -136,7 +136,7 @@ Start Postgres 16 on `localhost:5433`:
 docker compose up -d --wait
 ```
 
-Build the app (also runs the 148 tests):
+Build the app (also runs the 183 tests):
 
 ```bash
 mvn -q package
@@ -175,6 +175,13 @@ java -jar target/querywarden.jar ask "Top 5 customers by total spend on delivere
 | `check "SQL"` | Run your own SQL through the checks and the database, without Claude |
 | `schema` | Show exactly what Claude sees about your database |
 | `policy` | Show the policy in effect and which file it came from |
+| `serve --share [--host ADDRESS]` | Share the web page with colleagues; everyone signs in with their own token. See [Sharing with colleagues](#sharing-with-colleagues) |
+| `users [list \| add NAME [--reviewer] \| remove NAME]` | People who may sign in to the shared page; reviewers can verify answers |
+| `verified [list \| remove ID \| to-eval]` | Verified question-and-SQL pairs |
+| `feedback [--all]` | "Correct" / "Wrong" feedback waiting for review |
+| `grants` | Print the SQL that creates the read-only database user from `policy.yaml` (never runs it) |
+| `doctor` | Check the database user's real permissions against `policy.yaml`; exit code 1 if it can do more than allowed |
+| `eval …` | Measure accuracy. See [Evaluation](#evaluation-how-accurate-is-it) |
 | `setup` | **Demo only.** Creates the sample `shop` data and the `qw_agent` user. Refuses to run on a database that doesn't look like a demo database |
 | `--policy FILE` | Option for any command: use this policy file instead of `./policy.yaml` |
 | `--no-fallbacks` | Option for `ask`/`repl`: turn off server-side refusal fallbacks |
@@ -186,9 +193,10 @@ Stop the demo database with `docker compose down`. It keeps no data volume, so t
 
 The same agent and guardrails, in a browser. Works on a phone and in light and dark mode.
 
-- **Example questions** to click, taken from `examples` in `policy.yaml`. If the policy has none,
-  Claude suggests six that fit your tables when the server starts, so they always match the
-  database. The startup output says which source was used.
+- **Example questions** to click, written by Claude from the tables and business definitions it can
+  see, so they always fit the database you point QueryWarden at. They're cached in
+  `.querywarden/examples.json` and only rewritten when the tables or definitions change.
+  **More examples** asks for a different set. (To use your own, add an `examples:` list to `policy.yaml`.)
 - **Live progress** while you wait: Claude writing the SQL, the safety check, the query running.
   If a query is rejected, you see why and that Claude is correcting it.
 - **The answer** as a table and, when it helps, a chart. Switch between bar chart, line chart and
@@ -200,7 +208,17 @@ The same agent and guardrails, in a browser. Works on a phone and in light and d
 - **How it was answered**, right under the summary: Claude's plain-English explanation is always
   shown, and "SQL that was run" opens with one click. Open it once and it stays open for later
   answers (remembered in this browser). If a query was rejected and corrected, a note says so.
-- Recent questions (kept only in this browser) and the list of tables and columns you can ask about.
+- **Follow-up questions**: ask "Top 5 customers in 2025", then "now only Germany", then "same for
+  2024". The last three answered questions and their SQL go with each new question as context, and
+  "Understood as: …" shows how a follow-up was read. Every query is still checked like any other.
+- **Earlier answers** stay below the current one ("Earlier in this conversation"), each expandable,
+  with its chart kept as a picture. **New conversation** clears the memory.
+- **"Was this answer right? Correct / Wrong"** under every answer, with an optional comment. See
+  [Verified answers and feedback](#verified-answers-and-feedback).
+- **Verified-answer badges**: *Verified answer* (answered from checked SQL, no AI call), *Matches a
+  verified answer*, or *Based on similar verified answers*.
+- Recent questions (kept only in this browser, separately for each database) and the list of tables
+  and columns you can ask about.
 - **Settings** (sidebar button): a read-only view of the rules in effect, the models, whether results
   are shared with AI, and the web limits. Nothing can be changed from the page: edit `policy.yaml` or
   the `QW_*` variables and restart. Blocked columns are counted, not named, and no secrets are shown.
@@ -213,11 +231,17 @@ java -jar target/querywarden.jar serve
 
 Then open http://localhost:8080. Use `serve --port 9090` for another port. Stop it with Ctrl-C.
 
+**Changes apply while it runs.** Every 30 seconds the server checks `policy.yaml` and the database
+(tables, columns, comments, category values). When either changed, it switches to a fresh setup (new
+prompt, definitions and example questions) without a restart; questions already running finish on the
+old one, and open pages update their lists within a minute. If the new `policy.yaml` is invalid, the
+last good one stays in use and the Settings panel shows the error. Model settings (`QW_*` variables)
+still need a restart.
+
 The browser only talks to this server; it never reaches the database or Claude directly.
 
-**For now it is for one person on this computer.** The server listens on `127.0.0.1` only and
-refuses to start on any other address. Sharing it with colleagues needs access tokens first (see
-[docs/web-ui-plan.md](docs/web-ui-plan.md)).
+**By default it is for one person on this computer.** The server listens on `127.0.0.1` only, needs
+no sign-in, and refuses to start on any other address unless you share it (next section).
 
 Extra protections for the web page, on top of the agent's guardrails:
 
@@ -229,6 +253,7 @@ Extra protections for the web page, on top of the agent's guardrails:
 | Malicious text can't run | All questions, data and messages are shown as plain text; a strict Content-Security-Policy blocks any script that isn't the page's own |
 | Small requests only | Request bodies over 8 KB are refused |
 | No internal details | Errors show a plain message; the full detail goes to `audit.jsonl` (which also records the client address and timing) |
+| Sign-in when shared | With `--share`, every API request needs a personal access token; the audit log records who asked what; 10 wrong tokens from one address lock it out for 10 minutes |
 | Spreadsheet-safe CSV | Text starting with `=`, `+`, `-` or `@` is prefixed so spreadsheets don't run it as a formula |
 
 Charts start in the most useful view: a line chart for values over time, a bar chart for up to 30
@@ -239,6 +264,80 @@ ordered by.
 **Extra Claude calls on the web page.** Each answered question makes one more small Claude call
 (Claude Haiku 5.5 at low effort by default, typically 2–3 seconds) for the summary and follow-ups, and the server makes one call at
 startup if `policy.yaml` has no examples. Declined and blocked questions make no extra call.
+
+### Verified answers and feedback
+
+People mark answers **Correct** or **Wrong** (with an optional comment). Reviewers check them and save
+good question-and-SQL pairs as **verified answers**, which make later answers faster, cheaper and
+consistent:
+
+- **The same question** (ignoring case, punctuation and filler words), when it doesn't refer back to the
+  conversation, is answered straight from its verified SQL: no Claude call, about a second, always the
+  same result. The SQL still goes through every check before it runs; if it no longer passes (say the
+  policy changed), Claude answers instead.
+- **Similar questions** get up to three verified answers as examples. Claude reuses their logic, but
+  the business definitions in `policy.yaml` win if the two disagree, and Claude says so in its
+  explanation. If feedback shows a definition is wrong, fix the definition.
+
+Who reviews: on your own computer, you. On a shared page, only people added with `--reviewer`
+(`querywarden users add rita --reviewer`). Reviewers get:
+
+- **Mark as verified** on any answer.
+- A **Review** panel: feedback to check ("Wrong" first), with the question and SQL editable, **Try**
+  (runs the SQL through the checks and shows the first rows), **Verify** and **Dismiss**, and the list of
+  verified answers with **Remove**.
+
+Unsafe SQL can't be saved: verifying runs it through the same checks and read-only user as any answer.
+
+Where it's kept:
+
+| File | What | In git? |
+|---|---|---|
+| `policy.verified.json` (next to `policy.yaml`; `crm.yaml` → `crm.verified.json`) | Verified answers: question, SQL, who verified it and when | Yes: it's checked knowledge about your data. Changes apply at once |
+| `feedback.jsonl` (or `QW_FEEDBACK_FILE`) | Feedback: who, question, SQL, rating, comment, and how it was resolved | No |
+
+From the terminal:
+
+```bash
+java -jar target/querywarden.jar feedback
+```
+
+```bash
+java -jar target/querywarden.jar verified
+```
+
+`verified to-eval` prints the verified answers as evaluation questions, ready to paste into
+`eval/cases.yaml`, so checked answers also guard against future regressions.
+
+### Sharing with colleagues
+
+Each person gets their own access token. Only a fingerprint (SHA-256) of each token is stored, in
+`users.json` (or the file in `QW_USERS_FILE`), readable only by you and kept out of git.
+
+Add a person. Their token is shown once; give it to them privately:
+
+```bash
+java -jar target/querywarden.jar users add alice
+```
+
+Start the shared page (listens on every network address; add `--host ADDRESS` to pick one):
+
+```bash
+java -jar target/querywarden.jar serve --share
+```
+
+Colleagues open `http://<your computer's address>:8080` and paste their token. They stay signed in
+until they close the tab. To take someone's access away, at once and without a restart:
+
+```bash
+java -jar target/querywarden.jar users remove alice
+```
+
+Rate limits then apply per person, and the audit log records each question as `web alice@<address>`.
+
+> ⚠️ **This is plain HTTP**, so tokens and answers travel unencrypted. Use it only on a network you
+> trust, or put an HTTPS proxy (for example Caddy) in front. Everyone signed in sees the same data:
+> per-person data permissions (e.g. each region sees only its own rows) aren't built yet.
 
 ## Validating it
 
@@ -272,10 +371,18 @@ date range, cancelled orders counted, and so on).
 
 ## Evaluation: how accurate is it?
 
-`eval/cases.yaml` holds 34 questions about the demo data, each with hand-checked reference SQL
-(readable list: [eval/CASES.md](eval/CASES.md)): 8 easy, 10 medium, 6 hard, 2 deliberately
-ambiguous ones with several accepted readings, and 8 that must be declined (salary, SSNs, API keys,
-deleting, updating, off-topic, a salary filter, and a fake "admin approved" request).
+`eval/cases.yaml` holds 61 questions about the demo data, each with hand-checked reference SQL
+(readable list: [eval/CASES.md](eval/CASES.md)):
+
+- 8 easy, 10 medium and 6 hard
+- 7 that depend on the business definitions in `policy.yaml` (sales, open orders, last 3 months, …)
+- 16 harder ones: month-over-month and year-over-year changes, running totals, shares, quarter
+  comparisons, days between orders, and questions with typos
+- 4 follow-ups, each given earlier questions and SQL as context ("now only customers in Germany")
+- 10 that must be declined (salary, SSNs, API keys, deleting, updating, off-topic, a salary filter,
+  a fake "admin approved" request, a "bend the rules once" request, "rounded salaries aren't sensitive")
+
+Where a question can fairly be read two ways, every accepted reading has its own reference query.
 
 **Grading** runs every reference query and compares the result *values* with QueryWarden's rows:
 column names and extra columns don't matter, numbers are compared to 2 decimals, and order is
@@ -310,7 +417,31 @@ Results go to `.claude/hillclimb/sql-generation/<variant>/` (`results.jsonl`, `t
 `errors.jsonl` for technical failures, which are never scored). A run can be resumed; finished
 questions are skipped.
 
-### Results (2026-11-25, 34 questions × 2 runs per setup)
+### Latest results (2026-11-25, 61 questions × 2 runs per model)
+
+With business definitions and category values in the prompt (`--flow sql-generation-61`):
+
+| Model (medium effort) | Correct | Leaks | Tokens / question | Cost / question | Median time | Whole run |
+|---|---|---|---|---|---|---|
+| **Sonnet 5.5** (default) | 122/122 (95% range 97–100%) | 0 | 1,857 | $0.0028 | 2.5 s | $0.34 |
+| Opus 5.5 | 122/122 (97–100%) | 0 | 1,889 | $0.0070 | 3.1 s | $0.86 |
+
+- **Sonnet 5.5 matches Opus 5.5 on the harder set too, at 40% of the cost and a bit faster.** It stays the
+  default.
+- **Every question was answered on the first attempt** (1.00 Claude calls per question): the two SQL
+  check fixes found by the first comparison removed all the rejected-and-corrected queries.
+- **Follow-ups work** (8/8), including "now only customers in Germany", which failed before category
+  values were added (Claude guessed `'Germany'` where the data says `'DE'`).
+- **Accepted readings added after this run.** The first grading gave Sonnet 118/122 and Opus 117/122.
+  All 9 misses were reviewed: two older questions said "across all orders" while the new definitions
+  of units sold and order value exclude cancelled orders, and one answer listed December 2025 with
+  0 orders. Each is a fair answer, so it was added as an accepted reading (marked in
+  `eval/cases.yaml`), and the stored answers were graded again with `eval --regrade`, without new
+  Claude calls.
+- **Still saturated.** Both models get everything right, so this set can't rank them further. The
+  next step for the evaluation is real questions from the people who will use it.
+
+### Results of the first comparison (2026-11-25, the original 34 questions × 2 runs per setup)
 
 | Setup | Correct | Leaks | Tokens / question | Cost / question | Median time | Refusal fallbacks |
 |---|---|---|---|---|---|---|
@@ -365,32 +496,28 @@ can't affect your live application.
 - `allowed_tables`: tables Claude may use
 - `blocked_columns`: columns that must never be read (salaries, tokens, …)
 - `masked_columns`: columns that may be read but are hidden in output (email, phone, …)
+- `definitions`: what your business terms mean ("revenue excludes cancelled orders"), so the same
+  question always gets the same answer
 - `examples`: questions that fit your data, or leave it out and let Claude suggest them
+- `share_category_values`: whether Claude may see the values of short category columns (country
+  codes, statuses); without them it may guess `'Germany'` where the data says `'DE'`
 - `share_results_with_ai`: leave it `false` unless sending result rows to the Anthropic API is
   acceptable for this data
 
 Then check it with `java -jar target/querywarden.jar policy`. Keep a separate file per database
 if you like, and choose one with `--policy FILE` or `QW_POLICY`.
 
-**3. Create a read-only database user.** Run as an admin in `psql`, replacing the placeholders:
+**3. Create the read-only database user.** `grants` reads your real tables (through an admin
+connection: `QW_ADMIN_USER` / `QW_ADMIN_PASSWORD`) and prints the SQL. It never runs it. Every table is
+granted column by column, so a sensitive column added later stays unreadable until you grant it, and
+policy typos (a blocked column that doesn't exist) are flagged at the top:
 
-```sql
-CREATE ROLE qw_agent LOGIN PASSWORD 'choose-a-strong-password' NOINHERIT;
-ALTER ROLE qw_agent SET default_transaction_read_only = on;
-ALTER ROLE qw_agent SET statement_timeout = '3s';
-ALTER ROLE qw_agent SET search_path = your_schema;
-GRANT CONNECT ON DATABASE your_db TO qw_agent;
-GRANT USAGE ON SCHEMA your_schema TO qw_agent;
-
--- whole tables that are safe to read:
-GRANT SELECT ON your_schema.orders, your_schema.products TO qw_agent;
-
--- tables with sensitive columns: grant only the safe columns
-GRANT SELECT (id, name, department) ON your_schema.employees TO qw_agent;
+```bash
+java -jar target/querywarden.jar grants > grants.sql
 ```
 
-Then check that **PUBLIC** has no read access to sensitive tables (`\dp your_schema.*` in `psql`).
-Every user inherits PUBLIC's permissions, including `qw_agent`.
+Review `grants.sql`, replace `CHANGE-ME` with a strong password, run it as an administrator, then
+delete the file.
 
 **4. Point QueryWarden at it:**
 
@@ -402,14 +529,23 @@ export QW_DB_URL=jdbc:postgresql://your-host:5432/your_db
 export QW_AGENT_USER=qw_agent QW_AGENT_PASSWORD='choose-a-strong-password'
 ```
 
-**5. Check what Claude will see.** If anything sensitive appears here, fix the permissions or the
+**5. Check the user's real permissions.** `doctor` logs in as the agent's user and asks PostgreSQL
+what it can actually do, including anything inherited from other roles or from PUBLIC. It fails if
+the user can read a blocked column or a table outside the policy, write anything, create objects,
+switch to another role, or has dangerous role attributes. Run it again whenever permissions change:
+
+```bash
+java -jar target/querywarden.jar doctor
+```
+
+**6. Check what Claude will see.** If anything sensitive appears here, fix the permissions or the
 policy before asking anything:
 
 ```bash
 java -jar target/querywarden.jar schema
 ```
 
-**6. Test a restricted column, then start asking:**
+**7. Test a restricted column, then start asking:**
 
 ```bash
 java -jar target/querywarden.jar check "SELECT your_sensitive_column FROM your_table"
@@ -428,6 +564,10 @@ java -jar target/querywarden.jar ask "your first question"
 | Error messages when a query fails (personal data scrubbed) | |
 | Web page: the SQL and column names of each answer, to suggest follow-ups | |
 | Web page, only with `share_results_with_ai: true`: up to 50 result rows, after masking, for the summary | |
+| Business `definitions` from `policy.yaml` | |
+| Only with `share_category_values: true`: the values of short category columns (never masked or blocked columns, never name/email/phone-like columns) | |
+| For follow-ups: your last three questions in the conversation and their SQL | |
+| Up to three verified question-and-SQL pairs similar to the question | |
 
 `share_results_with_ai` is **off** unless the policy turns it on. The demo's `policy.yaml` turns it
 on because the demo data is fake. For a real database, decide deliberately: masked columns stay
@@ -458,6 +598,9 @@ examples:                    # optional; questions shown on the web page (at mos
   - How many orders are there per status?
   - Revenue by product category
 share_results_with_ai: false # true lets Claude see up to 50 masked result rows to write summaries
+share_category_values: false # true lets Claude see short category lists (country codes, statuses)
+definitions:                 # what business terms mean; applied unless a question says otherwise
+  revenue: SUM(quantity * unit_price), counting only orders that are not cancelled.
 limits:
   max_rows: 200
   timeout_ms: 3000
@@ -476,6 +619,17 @@ limits:
 - The policy controls QueryWarden's checks, masking and what Claude is shown. On a real database,
   give the agent's database user matching permissions too, so Postgres enforces the same rules.
 
+## How it compares
+
+A survey of similar tools (November 2026), including their documented security problems, is in
+[docs/research-2026-11.md](docs/research-2026-11.md), with sources.
+
+## Automatic tests on GitHub
+
+`.github/workflows/tests.yml` runs all tests on every push and pull request, on GitHub's Linux
+machines (which have Docker, so the Postgres tests run too). It needs no API key: the tests use a
+fake Claude. Failed runs keep the test reports for 7 days.
+
 ## Configuration
 
 | Variable | Default | Used for |
@@ -484,8 +638,10 @@ limits:
 | `QW_DB_URL` | `jdbc:postgresql://localhost:5432/shop` | Database connection |
 | `QW_AGENT_USER` / `QW_AGENT_PASSWORD` | `qw_agent` / `qw_agent_dev` | The read-only user every query runs as (change the password outside local demos) |
 | `QW_ADMIN_USER` / `QW_ADMIN_PASSWORD` | `postgres` / `postgres` | Only used by `setup` |
+| `QW_USERS_FILE` | `users.json` | People who may sign in to the shared page (fingerprints only) |
+| `QW_FEEDBACK_FILE` | `feedback.jsonl` | "Correct" / "Wrong" feedback |
 | `QW_POLICY` | none | Policy file to use when `--policy` isn't given (otherwise `./policy.yaml`) |
-| `QW_SQL_MODEL` / `QW_SQL_EFFORT` | `claude-opus-5-5` / `medium` | Model that writes the SQL (see [Models](#models)) |
+| `QW_SQL_MODEL` / `QW_SQL_EFFORT` | `claude-sonnet-5-5` / `medium` | Model that writes the SQL (see [Models](#models)) |
 | `QW_HELPER_MODEL` / `QW_HELPER_EFFORT` | `claude-haiku-5-5` / `low` | Model for examples, summaries and follow-ups |
 
 ## Limitations
@@ -502,6 +658,7 @@ limits:
 ## Project layout
 
 ```
+.github/workflows/tests.yml  runs all tests on GitHub on every push
 pom.xml                 Maven build (Java 21)
 policy.yaml             the rules: allowed tables, blocked/masked columns, limits
 docker-compose.yml      local Postgres 16 for the demo
@@ -515,6 +672,12 @@ src/main/java/dev/querywarden/
   ClaudeAiHelper.java   Claude-backed AiHelper (low effort; never breaks an answer)
   ModelSettings.java    which model and effort each job uses (QW_* variables)
   Usage.java            tokens and cost of Claude calls (written to the audit log)
+  Grants.java           SQL for the read-only database user, from the policy
+  Doctor.java           checks the database user's real permissions
+  UserStore.java        people who may sign in to the shared page
+  LiveRuntime.java      picks up policy.yaml and database changes while the server runs
+  VerifiedAnswers.java  checked question-and-SQL pairs, and matching questions to them
+  FeedbackStore.java    "Correct" / "Wrong" feedback
   eval/                 evaluation runner, result matcher and summary
 eval/
   cases.yaml            the 34 evaluation questions with reference SQL
@@ -533,6 +696,10 @@ src/test/java/dev/querywarden/
   PolicyTest.java             loading and checking policy files
   WebServerTest.java          web endpoints and protections (Testcontainers)
   ModelSettingsTest.java      model and effort settings
+  DoctorTest.java             grants and doctor against a real Postgres
+  UserStoreTest.java          access tokens
+  LiveRuntimeTest.java        live reload and the example cache
+  VerifiedAnswersTest.java    matching, the library and the feedback store
   eval/ResultMatcherTest.java how answers are compared with references
 ```
 
@@ -543,7 +710,7 @@ kind of job, set with environment variables so you can change them without rebui
 
 | Job | Variable | Default | Why |
 |---|---|---|---|
-| Writing the SQL | `QW_SQL_MODEL`, `QW_SQL_EFFORT` | `claude-opus-5-5`, `medium` | Accuracy matters most: a wrong query gives a confident wrong number |
+| Writing the SQL | `QW_SQL_MODEL`, `QW_SQL_EFFORT` | `claude-sonnet-5-5`, `medium` | Matched Opus 5.5 on every evaluation question at less than half the cost (see [Evaluation](#evaluation-how-accurate-is-it)) |
 | Example questions, summaries, follow-ups | `QW_HELPER_MODEL`, `QW_HELPER_EFFORT` | `claude-haiku-5-5`, `low` | Simple jobs where speed and cost matter more |
 
 Effort is one of `low`, `medium`, `high`, `xhigh`, `max`. Invalid values stop the program with a
@@ -553,10 +720,10 @@ in use.
 Prices per million tokens (input / output) when this was written: Opus 5.5 $4 / $20, Sonnet 5.5
 $2 / $10, Haiku 5.5 $0.10 / $0.50.
 
-For example, to try Sonnet 5.5 for the SQL at high effort:
+For example, to go back to Opus 5.5 for the SQL:
 
 ```bash
-export QW_SQL_MODEL=claude-sonnet-5-5 QW_SQL_EFFORT=high
+export QW_SQL_MODEL=claude-opus-5-5
 ```
 
 Change the SQL model only after comparing accuracy on the same questions; the helper model can be

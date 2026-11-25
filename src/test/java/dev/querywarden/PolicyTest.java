@@ -25,12 +25,41 @@ class PolicyTest {
         // The guardrails must match exactly; only the demo's examples and result sharing differ.
         assertEquals(new Policy(d.schema(), d.allowedTables(), d.blockedColumns(), d.maskedColumns(), d.maxRows(),
                         d.timeoutMillis(), d.maxJoins(), d.maxSelects(), d.maxQuestionChars(), d.maxSqlChars(),
-                        d.blockedFunctions(), shipped.examples(), shipped.shareResultsWithAi()),
+                        d.blockedFunctions(), shipped.examples(), shipped.shareResultsWithAi(), shipped.definitions(),
+                        shipped.shareCategoryValues()),
                 shipped, "policy.yaml in the project root should describe the demo database exactly");
-        assertEquals(6, shipped.examples().size());
+        assertTrue(shipped.examples().isEmpty(), "the demo lets Claude write the example questions");
         assertTrue(shipped.shareResultsWithAi(), "demo data is fake, so the demo shares results");
         assertTrue(d.examples().isEmpty());
         assertFalse(d.shareResultsWithAi(), "without a policy file, results never leave the machine");
+        assertFalse(d.shareCategoryValues(), "nor do category values");
+        assertTrue(shipped.shareCategoryValues(), "the demo shares them (fake data)");
+    }
+
+    @Test
+    void definitionsKeepTheirOrderAndAreValidated() throws Exception {
+        Policy p = Policy.parse("""
+                definitions:
+                  revenue: "Sum of quantity * unit_price, excluding cancelled orders."
+                  open order: "Status pending or shipped."
+                """, "test");
+        assertEquals(List.of("revenue", "open order"), List.copyOf(p.definitions().keySet()));
+        assertTrue(p.definitionsText().startsWith("- revenue: Sum of quantity"));
+        assertEquals(p, Policy.parse(p.toYaml(), "roundtrip"));
+
+        var e1 = assertThrows(Policy.PolicyException.class, () -> Policy.parse("definitions: [revenue]", "t"));
+        assertTrue(e1.getMessage().contains("must map a term"));
+        var e2 = assertThrows(Policy.PolicyException.class, () -> Policy.parse("definitions:\n  revenue: \"\"", "t"));
+        assertTrue(e2.getMessage().contains("must be a sentence"));
+        assertTrue(Policy.load(Path.of("policy.yaml")).definitions().containsKey("revenue"), "the demo policy defines revenue");
+    }
+
+    @Test
+    void definitionsReachClaudesInstructions() throws Exception {
+        Policy p = Policy.parse("definitions:\n  revenue: \"Excludes cancelled orders.\"", "t");
+        String block = QueryWardenAgent.definitionsBlock(p);
+        assertTrue(block.contains("Business definitions") && block.contains("- revenue: Excludes cancelled orders."));
+        assertEquals("", QueryWardenAgent.definitionsBlock(Policy.defaults()), "no section when there are none");
     }
 
     @Test

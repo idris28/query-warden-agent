@@ -215,24 +215,16 @@ public final class Database {
                 ps.setString(1, cfg.agentUser());
                 try (ResultSet rs = ps.executeQuery()) { exists = rs.next(); }
             }
-            String pw = "'" + cfg.agentPassword().replace("'", "''") + "'";
-            st.execute((exists ? "ALTER ROLE " : "CREATE ROLE ") + agent
-                    + " LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD " + pw);
+            // Same statements `querywarden grants` prints, so the demo and real setups can't drift apart.
+            Grants.Plan plan = Grants.plan(c, policy, cfg.agentUser(), cfg.agentPassword(), exists);
+            for (String sql : plan.roleStatements()) st.execute(sql);
             st.execute("COMMENT ON ROLE " + agent + " IS '" + DEMO_MARKER + "'");
-            st.execute("ALTER ROLE " + agent + " SET default_transaction_read_only = on");
-            st.execute("ALTER ROLE " + agent + " SET statement_timeout = '" + policy.timeoutMillis() + "ms'");
-            st.execute("ALTER ROLE " + agent + " SET idle_in_transaction_session_timeout = '10s'");
-            st.execute("ALTER ROLE " + agent + " SET search_path = " + s);
             st.execute("REVOKE ALL ON SCHEMA public FROM " + agent);
             st.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
             st.execute("REVOKE TEMPORARY ON DATABASE " + ident(c.getCatalog()) + " FROM PUBLIC");
-            st.execute("GRANT USAGE ON SCHEMA " + s + " TO " + agent);
-            for (Map.Entry<String, List<String>> t : columns(c, policy.schema()).entrySet()) {
-                if (!policy.tableAllowed(t.getKey())) continue; // e.g. api_keys: no grant at all
-                List<String> cols = t.getValue().stream()
-                        .filter(col -> policy.columnAllowed(t.getKey(), col)).map(Database::ident).toList();
-                st.execute("GRANT SELECT (" + String.join(", ", cols) + ") ON " + s + "." + ident(t.getKey())
-                        + " TO " + agent);
+            for (String sql : plan.grantStatements()) {
+                int comment = sql.indexOf("   -- ");
+                st.execute(comment < 0 ? sql : sql.substring(0, comment));
             }
             c.commit();
         }
@@ -241,7 +233,15 @@ public final class Database {
     /** A table Claude may use, with its visible columns and foreign keys. */
     public record TableInfo(String name, List<ColumnInfo> columns, List<String> foreignKeys) {}
 
-    public record ColumnInfo(String name, String type, String note) {}
+    /** {@code values}: the distinct values of a short category column, when the policy shares them. */
+    public record ColumnInfo(String name, String type, String note, List<String> values) {
+        public ColumnInfo(String name, String type, String note) {
+            this(name, type, note, List.of());
+        }
+    }
+
+    static final int MAX_CATEGORY_VALUES = 25;
+    static final int MAX_CATEGORY_VALUE_CHARS = 40;
 
     /**
      * Tables and columns visible to the agent, read through the agent's own connection:
@@ -292,9 +292,66 @@ public final class Database {
                     }
                 }
             }
+            if (policy.shareCategoryValues()) addCategoryValues(c, policy, columns);
             List<TableInfo> out = new ArrayList<>();
             columns.forEach((t, cols) -> out.add(new TableInfo(t, List.copyOf(cols), List.copyOf(fks.get(t)))));
             return out;
+        }
+    }
+
+    /**
+     * For text columns with only a few short distinct values (country codes, statuses, categories),
+     * records those values so Claude writes country = 'DE' rather than guessing 'Germany'. Masked
+     * columns are skipped (blocked ones aren't readable at all). Runs as the agent's own user.
+     */
+    static void addCategoryValues(Connection c, Policy policy, Map<String, List<ColumnInfo>> columns) {
+        for (var e : columns.entrySet()) {
+            List<ColumnInfo> updated = new ArrayList<>();
+            for (ColumnInfo col : e.getValue()) {
+                List<String> values = categoryValues(c, policy, e.getKey(), col);
+                updated.add(values.isEmpty() ? col : new ColumnInfo(col.name(), col.type(), col.note(), values));
+            }
+            e.setValue(updated);
+        }
+    }
+
+    /** Column names that hold personal or free-form data, never treated as categories. */
+    static final java.util.regex.Pattern PERSONAL = java.util.regex.Pattern.compile(
+            "(?i).*(name|email|mail|phone|mobile|address|street|zip|postcode|postal|ssn|passport|iban|account|"
+                    + "card|token|secret|password|note|comment|description|ip).*");
+    static final int CATEGORY_SAMPLE_ROWS = 10_000;
+    static final int MIN_REPEATS_PER_VALUE = 3;
+
+    /**
+     * The values of a short category column, or an empty list. A real category repeats: on average each
+     * value must appear at least {@link #MIN_REPEATS_PER_VALUE} times in a sample of up to
+     * {@link #CATEGORY_SAMPLE_ROWS} rows, which leaves out unique-ish columns such as names even when a
+     * small table has only a few of them.
+     */
+    static List<String> categoryValues(Connection c, Policy policy, String table, ColumnInfo col) {
+        boolean text = col.type().equals("text") || col.type().startsWith("character");
+        if (!text || policy.isMasked(col.name()) || PERSONAL.matcher(col.name()).matches()) return List.of();
+        String sample = "(SELECT " + ident(col.name()) + " AS v FROM " + ident(policy.schema()) + "." + ident(table)
+                + " LIMIT " + CATEGORY_SAMPLE_ROWS + ") s";
+        try (Statement st = c.createStatement()) {
+            long rows, distinct;
+            try (ResultSet rs = st.executeQuery("SELECT COUNT(v), COUNT(DISTINCT v) FROM " + sample)) {
+                rs.next();
+                rows = rs.getLong(1);
+                distinct = rs.getLong(2);
+            }
+            if (distinct == 0 || distinct > MAX_CATEGORY_VALUES || rows < distinct * MIN_REPEATS_PER_VALUE) return List.of();
+            List<String> values = new ArrayList<>();
+            try (ResultSet rs = st.executeQuery("SELECT DISTINCT v FROM " + sample + " WHERE v IS NOT NULL ORDER BY 1")) {
+                while (rs.next()) {
+                    String v = rs.getString(1);
+                    if (v.length() > MAX_CATEGORY_VALUE_CHARS) return List.of();
+                    values.add(v);
+                }
+            }
+            return List.copyOf(values);
+        } catch (SQLException ex) {
+            return List.of();   // can't read it quickly enough (or at all): just don't list values
         }
     }
 
@@ -309,7 +366,12 @@ public final class Database {
             out.append("TABLE ").append(t.name()).append(" (\n");
             List<String> lines = new ArrayList<>();
             for (ColumnInfo col : t.columns())
-                lines.add("    " + col.name() + " " + col.type() + (col.note() != null ? "  -- " + col.note() : ""));
+            {
+                List<String> notes = new ArrayList<>();
+                if (col.note() != null) notes.add(col.note());
+                if (!col.values().isEmpty()) notes.add("values: " + String.join(", ", col.values()));
+                lines.add("    " + col.name() + " " + col.type() + (notes.isEmpty() ? "" : "  -- " + String.join("; ", notes)));
+            }
             for (String fk : t.foreignKeys()) lines.add("    FK " + fk);
             out.append(String.join("\n", lines)).append("\n)\n");
         }

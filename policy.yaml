@@ -34,15 +34,36 @@ masked_columns: [email, phone]
 # functions (pg_sleep, pg_read_file, set_config, dblink, ...), which always applies.
 blocked_functions: []
 
-# Example questions shown under the question box on the web page (at most 12).
-# Leave this out and the web page asks Claude to suggest examples that fit the tables above.
-examples:
-  - How many orders are there per status?
-  - Top 5 customers by total spend on delivered orders
-  - Monthly revenue in 2025
-  - Revenue by product category
-  - Which country has the most customers?
-  - Average order value by month in 2025
+# Example questions on the web page are written by Claude from the tables and definitions above, so
+# they always fit the database you point QueryWarden at. To use your own instead, add:
+#   examples:
+#     - How many orders are there per status?
+
+# What your business terms mean. Claude applies these whenever a question uses the term (or an
+# obvious synonym), unless the question explicitly asks for something else. This is how the same
+# question gets the same answer every time. At most 40 terms.
+definitions:
+  revenue: >-
+    SUM(quantity * unit_price) over order_items, counting only orders whose status is not
+    'cancelled'. "Sales", "income" and "turnover" mean revenue.
+  order value: >-
+    The revenue of a single order: SUM(quantity * unit_price) of its items. Cancelled orders have
+    no order value, so leave them out of averages and totals of order value.
+  units sold: SUM(quantity) over order_items, counting only orders that are not cancelled.
+  best customer: >-
+    Customers are ranked by revenue (as defined above). "Top", "biggest" and "most valuable"
+    customers mean the same.
+  completed order: An order with status 'delivered'.
+  open order: An order with status 'pending' or 'shipped'.
+  recent period: >-
+    "Last N days/weeks/months", "recent" and "latest" count back from the latest order_date in the
+    orders table, not from today's date (the data ends before today).
+
+# Whether Claude may see the values of short category columns (at most 25 distinct values of up to
+# 40 characters, e.g. country codes, statuses, product categories), so it writes country = 'DE'
+# instead of guessing 'Germany'. Masked and blocked columns are never included.
+# The demo data is fake, so it's on here. Check your category columns before turning it on.
+share_category_values: true
 
 # Whether Claude may see query results, to write a one-line summary of each answer.
 # true:  up to 50 result rows are sent to the Anthropic API, after masking.

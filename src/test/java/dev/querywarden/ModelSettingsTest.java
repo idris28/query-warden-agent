@@ -12,9 +12,9 @@ import org.junit.jupiter.api.Test;
 class ModelSettingsTest {
 
     @Test
-    void defaultsAreOpusForSqlAndHaikuForHelpers() {
+    void defaultsAreSonnetForSqlAndHaikuForHelpers() {
         ModelSettings d = ModelSettings.fromMap(Map.of());
-        assertEquals("claude-opus-5-5", d.sqlModel());
+        assertEquals("claude-sonnet-5-5", d.sqlModel());
         assertEquals("medium", d.sqlEffort());
         assertEquals("claude-haiku-5-5", d.helperModel());
         assertEquals("low", d.helperEffort());
@@ -23,9 +23,9 @@ class ModelSettingsTest {
     @Test
     void environmentOverridesEachSetting() {
         ModelSettings m = ModelSettings.fromMap(Map.of(
-                "QW_SQL_MODEL", "claude-sonnet-5-5", "QW_SQL_EFFORT", "HIGH",
+                "QW_SQL_MODEL", "claude-opus-5-5", "QW_SQL_EFFORT", "HIGH",
                 "QW_HELPER_MODEL", " claude-sonnet-5-5 ", "QW_HELPER_EFFORT", ""));
-        assertEquals("claude-sonnet-5-5", m.sqlModel());
+        assertEquals("claude-opus-5-5", m.sqlModel());
         assertEquals("high", m.sqlEffort(), "effort is case-insensitive");
         assertEquals("claude-sonnet-5-5", m.helperModel(), "surrounding spaces are ignored");
         assertEquals("low", m.helperEffort(), "blank keeps the default");

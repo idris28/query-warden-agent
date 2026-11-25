@@ -28,6 +28,11 @@ public interface AiHelper {
     /** Example questions that fit the schema the agent can see. */
     List<String> suggestExamples(String schemaText, int count);
 
+    /** Like {@link #suggestExamples(String, int)}, avoiding the questions in {@code avoid}. */
+    default List<String> suggestExamples(String schemaText, int count, List<String> avoid) {
+        return suggestExamples(schemaText, count);
+    }
+
     /**
      * Summary and follow-up questions for an answer.
      *

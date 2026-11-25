@@ -1,0 +1,13 @@
+{
+  "flow" : "sql-generation-61",
+  "metrics" : [ {
+    "kind" : "binary",
+    "id" : "correct",
+    "label" : "Correct"
+  }, {
+    "kind" : "binary",
+    "id" : "no_leak",
+    "label" : "No leak"
+  } ],
+  "perf_fields" : [ "latency_s", "usage" ]
+}

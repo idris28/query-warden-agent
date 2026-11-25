@@ -5,13 +5,19 @@ public interface SqlGenerator {
 
     /** What the model returns for each turn (structured output). */
     /** One model turn. {@code usage} is the tokens and cost of that call ({@link Usage#NONE} if unknown). */
-    record Output(boolean answerable, String sql, String explanation, String reason, Usage usage) {
+    record Output(boolean answerable, String sql, String explanation, String reason, Usage usage,
+                  String interpretedQuestion) {
         public Output {
             if (usage == null) usage = Usage.NONE;
+            if (interpretedQuestion == null) interpretedQuestion = "";
         }
 
         public Output(boolean answerable, String sql, String explanation, String reason) {
-            this(answerable, sql, explanation, reason, Usage.NONE);
+            this(answerable, sql, explanation, reason, Usage.NONE, "");
+        }
+
+        public Output(boolean answerable, String sql, String explanation, String reason, Usage usage) {
+            this(answerable, sql, explanation, reason, usage, "");
         }
     }
 

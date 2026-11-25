@@ -42,15 +42,36 @@ import io.javalin.http.staticfiles.Location;
 public final class WebServer {
 
     /** Settings for the server. */
-    public record Options(String host, int port, int maxInFlight, int perClientPerMinute) {
+    /**
+     * Settings for the server. {@code users} is null for local use (this computer only, no sign-in);
+     * with a user store the page is shared: it may listen on the network, and every API request needs
+     * a valid access token.
+     */
+    public record Options(String host, int port, int maxInFlight, int perClientPerMinute, UserStore users) {
+        public Options(String host, int port, int maxInFlight, int perClientPerMinute) {
+            this(host, port, maxInFlight, perClientPerMinute, null);
+        }
+
         public static Options defaults() {
             return new Options("127.0.0.1", 8080, 4, 10);
         }
 
         public Options withPort(int p) {
-            return new Options(host, p, maxInFlight, perClientPerMinute);
+            return new Options(host, p, maxInFlight, perClientPerMinute, users);
+        }
+
+        public Options shared(String h, UserStore u) {
+            return new Options(h, port, maxInFlight, perClientPerMinute, u);
+        }
+
+        public boolean sharing() {
+            return users != null;
         }
     }
+
+    static final int MAX_FAILED_SIGN_INS = 10;
+    static final long SIGN_IN_WINDOW_MS = 10 * 60_000;
+    private final Map<String, Deque<Long>> failedSignIns = new HashMap<>();
 
     static final Set<String> LOCAL_HOSTNAMES = Set.of("localhost", "127.0.0.1", "[::1]", "::1");
 
@@ -73,12 +94,16 @@ public final class WebServer {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private final QueryWardenAgent agent;
-    private final Policy policy;
+    /**
+     * Everything that depends on the policy and the database: swapped as a whole when either changes
+     * (see {@link LiveRuntime}). Each request reads it once, so it never mixes an old and a new setup.
+     */
+    public record Runtime(QueryWardenAgent agent, Policy policy, List<Database.TableInfo> tables, Examples examples,
+                          String policySource, java.time.Instant loadedAt, VerifiedAnswers verified) {}
+
+    private final Supplier<Runtime> runtime;
     private final DataSource agentConnections;
-    private final Supplier<List<Database.TableInfo>> schema;
     private final AiHelper ai;
-    private final Examples examples;
     private final Options options;
     private final Semaphore inFlight;
     private final Map<String, Deque<Long>> recentByClient = new HashMap<>();
@@ -93,19 +118,35 @@ public final class WebServer {
 
     public WebServer(QueryWardenAgent agent, Policy policy, DataSource agentConnections,
                      Supplier<List<Database.TableInfo>> schema, AiHelper ai, Examples examples, Options options) {
-        this.agent = agent;
-        this.policy = policy;
+        this(fixed(new Runtime(agent, policy, schema.get(), examples, null, java.time.Instant.now(), null)),
+                agentConnections, ai, options);
+    }
+
+    /** A server whose setup can change while it runs (live reload of policy and schema). */
+    public WebServer(Supplier<Runtime> runtime, DataSource agentConnections, AiHelper ai, Options options) {
+        this.runtime = runtime;
         this.agentConnections = agentConnections;
-        this.schema = schema;
         this.ai = ai;
-        this.examples = examples;
         this.options = options;
         this.inFlight = new Semaphore(options.maxInFlight());
     }
 
+    private static Supplier<Runtime> fixed(Runtime r) {
+        return () -> r;
+    }
+
     /** Builds and starts the server. Throws if the host isn't a loopback address. */
     public Javalin start() {
-        requireLoopback(options.host());
+        if (!options.sharing()) {
+            requireLoopback(options.host());
+        } else {
+            try {
+                if (options.users().list().isEmpty())
+                    throw new IllegalArgumentException("Sharing needs at least one person. Add one with: querywarden users add NAME");
+            } catch (java.io.IOException e) {
+                throw new IllegalArgumentException("Can't read " + options.users().file() + ": " + e.getMessage());
+            }
+        }
         Javalin app = Javalin.create(config -> {
             config.startup.showJavalinBanner = false;
             config.jetty.host = options.host();
@@ -115,10 +156,18 @@ public final class WebServer {
 
             config.routes.before(this::guard);
             config.routes.get("/api/health", this::health);
+            config.routes.get("/api/me", this::me);
             config.routes.get("/api/schema", this::schema);
             config.routes.get("/api/settings", this::settings);
             config.routes.post("/api/ask", this::ask);
             config.routes.post("/api/ask/stream", this::askStream);
+            config.routes.post("/api/examples/refresh", this::refreshExamples);
+            config.routes.post("/api/feedback", this::giveFeedback);
+            config.routes.get("/api/review", this::review);
+            config.routes.post("/api/review/try", this::trySql);
+            config.routes.post("/api/review/verify", this::verify);
+            config.routes.post("/api/review/dismiss", this::dismiss);
+            config.routes.post("/api/review/remove", this::removeVerified);
             config.routes.exception(Exception.class, (e, ctx) -> {
                 System.err.println("web: unexpected error on " + ctx.path() + ": " + e);
                 json(ctx, 500, Map.of("status", "failed", "message", "Something went wrong on the server."));
@@ -152,16 +201,94 @@ public final class WebServer {
         ctx.header("Cross-Origin-Resource-Policy", "same-origin");
         if (ctx.path().startsWith("/api/")) ctx.header("Cache-Control", "no-store");
 
-        if (!isLocalHostHeader(ctx.header("Host"))) {
-            ctx.status(403).result("Forbidden: this page only answers on localhost.");
+        if (!options.sharing()) {
+            if (!isLocalHostHeader(ctx.header("Host"))) {
+                ctx.status(403).result("Forbidden: this page only answers on localhost.");
+                ctx.skipRemainingHandlers();
+                return;
+            }
+            String origin = ctx.header("Origin");
+            if (origin != null && !isLocalOrigin(origin, boundPort)) {
+                json(ctx, 403, Map.of("status", "failed", "message", "Requests from other websites are not allowed."));
+                ctx.skipRemainingHandlers();
+            }
+            return;
+        }
+
+        // Shared: any address may load the page, but the API needs a token, and requests must come
+        // from the page itself (same origin as the Host it was loaded from).
+        String origin = ctx.header("Origin");
+        if (origin != null && !isSameOrigin(origin, ctx.header("Host"))) {
+            json(ctx, 403, Map.of("status", "failed", "message", "Requests from other websites are not allowed."));
             ctx.skipRemainingHandlers();
             return;
         }
-        String origin = ctx.header("Origin");
-        if (origin != null && !isLocalOrigin(origin, boundPort)) {
-            json(ctx, 403, Map.of("status", "failed", "message", "Requests from other websites are not allowed."));
+        if (!ctx.path().startsWith("/api/")) return;   // the page itself (it shows the sign-in form)
+        String ip = ctx.ip();
+        if (tooManyFailures(ip)) {
+            json(ctx, 429, Map.of("status", "failed", "message",
+                    "Too many failed sign-ins from this address. Wait 10 minutes and try again."));
             ctx.skipRemainingHandlers();
+            return;
         }
+        String auth = ctx.header("Authorization");
+        String token = auth != null && auth.startsWith("Bearer ") ? auth.substring(7).strip() : null;
+        var who = options.users().authenticate(token);
+        if (who.isEmpty()) {
+            if (token != null) recordFailure(ip);
+            json(ctx, 401, Map.of("status", "failed", "auth", "required",
+                    "message", token == null ? "Sign in with your access token." : "That access token isn't valid."));
+            ctx.skipRemainingHandlers();
+            return;
+        }
+        ctx.attribute("user", who.get());
+    }
+
+    /** Who is asking: "web alice@10.0.0.5" when shared, "web 127.0.0.1" locally. For the audit log. */
+    private static String client(Context ctx) {
+        Object user = ctx.attribute("user");
+        return "web " + (user == null ? "" : user + "@") + ctx.ip();
+    }
+
+    /** Rate limits apply per person when shared, per address locally. */
+    private static String limitKey(Context ctx) {
+        Object user = ctx.attribute("user");
+        return user == null ? ctx.ip() : "user:" + user;
+    }
+
+    static boolean isSameOrigin(String origin, String host) {
+        try {
+            URI u = URI.create(origin);
+            if (u.getHost() == null || host == null) return false;
+            String o = u.getHost().toLowerCase(Locale.ROOT) + (u.getPort() < 0 ? "" : ":" + u.getPort());
+            String h = host.toLowerCase(Locale.ROOT).strip();
+            boolean defaultPort = u.getPort() < 0 || ("http".equals(u.getScheme()) && u.getPort() == 80)
+                    || ("https".equals(u.getScheme()) && u.getPort() == 443);
+            return o.equals(h) || (defaultPort && u.getHost().toLowerCase(Locale.ROOT).equals(h.replaceAll(":(80|443)$", "")));
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private synchronized boolean tooManyFailures(String ip) {
+        Deque<Long> times = failedSignIns.get(ip);
+        if (times == null) return false;
+        long now = System.currentTimeMillis();
+        while (!times.isEmpty() && now - times.peekFirst() > SIGN_IN_WINDOW_MS) times.pollFirst();
+        return times.size() >= MAX_FAILED_SIGN_INS;
+    }
+
+    private synchronized void recordFailure(String ip) {
+        failedSignIns.computeIfAbsent(ip, k -> new ArrayDeque<>()).addLast(System.currentTimeMillis());
+    }
+
+    private void me(Context ctx) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("name", ctx.attribute("user"));
+        out.put("sharing", options.sharing());
+        out.put("reviewer", isReviewer(ctx));
+        out.put("feedback", feedback != null);
+        json(ctx, 200, out);
     }
 
     static boolean isLocalHostHeader(String host) {
@@ -199,47 +326,65 @@ public final class WebServer {
     }
 
     private void schema(Context ctx) {
+        Runtime rt = runtime.get();
         List<Map<String, Object>> tables = new ArrayList<>();
-        for (Database.TableInfo t : schema.get()) {
+        for (Database.TableInfo t : rt.tables()) {
             List<Map<String, Object>> cols = new ArrayList<>();
             for (Database.ColumnInfo c : t.columns()) {
                 Map<String, Object> col = new LinkedHashMap<>();
                 col.put("name", c.name());
                 col.put("type", c.type());
                 col.put("note", c.note());
-                col.put("masked", policy.isMasked(c.name()));
+                col.put("masked", rt.policy().isMasked(c.name()));
                 cols.add(col);
             }
             tables.add(Map.of("name", t.name(), "columns", cols));
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("tables", tables);
-        out.put("examples", examples.questions());
-        out.put("examples_source", examples.source());
-        out.put("shares_results_with_ai", policy.shareResultsWithAi());
-        out.put("max_question_chars", policy.maxQuestionChars());
-        out.put("max_rows", policy.maxRows());
+        out.put("examples", rt.examples().questions());
+        out.put("examples_source", rt.examples().source());
+        out.put("examples_refreshable", exampleRefresher != null);
+        out.put("database_id", databaseId(rt));
+        out.put("shares_results_with_ai", rt.policy().shareResultsWithAi());
+        out.put("max_question_chars", rt.policy().maxQuestionChars());
+        out.put("max_rows", rt.policy().maxRows());
         json(ctx, 200, out);
     }
 
-    /** Reads {"question": "..."} and applies the rate and busy limits. Returns null after replying with an error. */
-    private String admit(Context ctx) {
+    /** A question plus earlier turns of the same conversation (for follow-ups). */
+    record Request(String question, List<QueryWardenAgent.Turn> history) {}
+
+    /**
+     * Reads {"question": "...", "history": [{"question": "...", "sql": "..."}]} and applies the rate and
+     * busy limits. Returns null after replying with an error.
+     */
+    private Request admit(Context ctx) {
         String type = ctx.contentType() == null ? "" : ctx.contentType().toLowerCase(Locale.ROOT);
         if (!type.startsWith("application/json")) {
             json(ctx, 415, failed("Send the question as JSON."));
             return null;
         }
         String question;
+        List<QueryWardenAgent.Turn> history = new ArrayList<>();
         try {
             JsonNode body = JSON.readTree(ctx.body());
             JsonNode q = body == null ? null : body.get("question");
             if (q == null || !q.isTextual()) throw new IllegalArgumentException();
             question = q.asText();
+            JsonNode h = body.path("history");
+            if (!h.isMissingNode() && !h.isNull()) {
+                if (!h.isArray() || h.size() > 10) throw new IllegalArgumentException();
+                for (JsonNode t : h) {
+                    if (!t.path("question").isTextual() || !t.path("sql").isTextual()) throw new IllegalArgumentException();
+                    history.add(new QueryWardenAgent.Turn(t.get("question").asText(), t.get("sql").asText()));
+                }
+            }
         } catch (Exception e) {
             json(ctx, 400, failed("Expected {\"question\": \"...\"}."));
             return null;
         }
-        if (!allow(ctx.ip())) {
+        if (!allow(limitKey(ctx))) {
             json(ctx, 429, failed("Too many questions. You can ask up to " + options.perClientPerMinute()
                     + " per minute; please wait a moment."));
             return null;
@@ -248,17 +393,19 @@ public final class WebServer {
             json(ctx, 503, failed("QueryWarden is busy with other questions. Please try again in a few seconds."));
             return null;
         }
-        return question;   // caller must release inFlight
+        return new Request(question, history);   // caller must release inFlight
     }
 
     private void ask(Context ctx) {
-        String question = admit(ctx);
-        if (question == null) return;
-        String client = ctx.ip();
+        Runtime rt = runtime.get();
+        Request req = admit(ctx);
+        if (req == null) return;
+        String question = req.question();
+        String client = client(ctx);
         long start = System.nanoTime();
         QueryWardenAgent.Result r;
         try {
-            r = agent.ask(question, "web " + client);
+            r = rt.agent().ask(question, client, p -> { }, req.history());
         } finally {
             inFlight.release();
         }
@@ -276,9 +423,11 @@ public final class WebServer {
      * </pre>
      */
     private void askStream(Context ctx) throws Exception {
-        String question = admit(ctx);
-        if (question == null) return;
-        String client = ctx.ip();
+        Runtime rt = runtime.get();
+        Request req = admit(ctx);
+        if (req == null) return;
+        String question = req.question();
+        String client = client(ctx);
         try {
             var res = ctx.res();
             res.setStatus(200);
@@ -297,19 +446,21 @@ public final class WebServer {
                 }
             };
             long start = System.nanoTime();
-            QueryWardenAgent.Result r = agent.ask(question, "web " + client,
-                    p -> send.accept(Map.of("type", "progress", "stage", p.stage(), "text", p.text())));
+            QueryWardenAgent.Result r = rt.agent().ask(question, client,
+                    p -> send.accept(Map.of("type", "progress", "stage", p.stage(), "text", p.text())), req.history());
             Map<String, Object> result = new LinkedHashMap<>(toJson(r, (System.nanoTime() - start) / 1_000_000));
             result.put("type", "result");
             send.accept(result);
 
             if (r.status() == QueryWardenAgent.Status.OK && ai != AiHelper.NONE) {
-                boolean share = policy.shareResultsWithAi();
+                boolean share = rt.policy().shareResultsWithAi();
                 send.accept(Map.of("type", "progress", "stage", "summarizing",
                         "text", share ? "Claude is summarising the result" : "Claude is suggesting follow-up questions"));
-                AiHelper.Insight insight = ai.describe(Database.formatSchema(schema.get()), question, r.sql(),
+                String context = Database.formatSchema(rt.tables())
+                        + (rt.policy().definitions().isEmpty() ? "" : "\n\nBusiness definitions:\n" + rt.policy().definitionsText());
+                AiHelper.Insight insight = ai.describe(context, question, r.sql(),
                         r.result().columns(), share ? r.result().rows() : null);
-                agent.auditHelperCall(question, "web " + client, insight.usage());
+                rt.agent().auditHelperCall(question, client, insight.usage());
                 send.accept(Map.of("type", "insights", "summary", insight.summary(), "follow_ups", insight.followUps()));
             }
             send.accept(Map.of("type", "done"));
@@ -324,6 +475,15 @@ public final class WebServer {
     private volatile String policySource = "not given";
     private volatile ModelSettings models = ModelSettings.defaults();
     private volatile boolean fallbacksRequested = true;
+    private volatile Supplier<Map<String, Object>> liveStatus = () -> Map.of("enabled", false);
+    private volatile Supplier<Examples> exampleRefresher = null;
+
+    /** Live reload status for the settings panel, and how to fetch a fresh set of example questions. */
+    public WebServer withLive(Supplier<Map<String, Object>> status, Supplier<Examples> refresher) {
+        this.liveStatus = status;
+        this.exampleRefresher = refresher;
+        return this;
+    }
 
     /** What the settings panel shows about where the policy came from and which models answer. */
     public WebServer withInfo(String policySource, ModelSettings models, boolean fallbacksRequested) {
@@ -339,29 +499,33 @@ public final class WebServer {
      * the page just as they are kept out of what Claude sees.
      */
     private void settings(Context ctx) {
+        Runtime rt = runtime.get();
         List<Map<String, Object>> blocked = new ArrayList<>();
-        policy.blockedColumns().entrySet().stream().sorted(Map.Entry.comparingByKey())
-                .filter(e -> !e.getValue().isEmpty() && policy.tableAllowed(e.getKey()))
+        rt.policy().blockedColumns().entrySet().stream().sorted(Map.Entry.comparingByKey())
+                .filter(e -> !e.getValue().isEmpty() && rt.policy().tableAllowed(e.getKey()))
                 .forEach(e -> blocked.add(Map.of("table", e.getKey(), "count", e.getValue().size())));
 
         Map<String, Object> limits = new LinkedHashMap<>();
-        limits.put("max_rows", policy.maxRows());
-        limits.put("timeout_ms", policy.timeoutMillis());
-        limits.put("max_joins", policy.maxJoins());
-        limits.put("max_selects", policy.maxSelects());
-        limits.put("max_question_chars", policy.maxQuestionChars());
-        limits.put("max_sql_chars", policy.maxSqlChars());
+        limits.put("max_rows", rt.policy().maxRows());
+        limits.put("timeout_ms", rt.policy().timeoutMillis());
+        limits.put("max_joins", rt.policy().maxJoins());
+        limits.put("max_selects", rt.policy().maxSelects());
+        limits.put("max_question_chars", rt.policy().maxQuestionChars());
+        limits.put("max_sql_chars", rt.policy().maxSqlChars());
 
         Map<String, Object> pol = new LinkedHashMap<>();
-        pol.put("source", policySource);
-        pol.put("schema", policy.schema());
-        pol.put("allowed_tables", policy.allowedTables().stream().sorted().toList());
+        pol.put("source", rt.policySource() != null ? rt.policySource() : policySource);
+        pol.put("loaded_at", rt.loadedAt().toString());
+        pol.put("schema", rt.policy().schema());
+        pol.put("allowed_tables", rt.policy().allowedTables().stream().sorted().toList());
         pol.put("blocked_columns", blocked);
-        pol.put("masked_columns", policy.maskedColumns().stream().sorted().toList());
-        pol.put("blocked_functions", policy.blockedFunctions().size());
+        pol.put("masked_columns", rt.policy().maskedColumns().stream().sorted().toList());
+        pol.put("blocked_functions", rt.policy().blockedFunctions().size());
         pol.put("limits", limits);
-        pol.put("examples_source", examples.source());
-        pol.put("share_results_with_ai", policy.shareResultsWithAi());
+        pol.put("examples_source", rt.examples().source());
+        pol.put("share_results_with_ai", rt.policy().shareResultsWithAi());
+        pol.put("definitions", rt.policy().definitions());
+        pol.put("share_category_values", rt.policy().shareCategoryValues());
 
         Map<String, Object> ai = new LinkedHashMap<>();
         ai.put("sql_model", models.sqlModel());
@@ -374,7 +538,13 @@ public final class WebServer {
 
         Map<String, Object> web = new LinkedHashMap<>();
         web.put("address", options.host() + ":" + boundPort);
-        web.put("local_only", true);
+        web.put("local_only", !options.sharing());
+        web.put("signed_in_as", ctx.attribute("user"));
+        try {
+            web.put("people", options.sharing() ? options.users().list().size() : 0);
+        } catch (java.io.IOException e) {
+            web.put("people", 0);
+        }
         web.put("questions_per_minute", options.perClientPerMinute());
         web.put("questions_at_once", options.maxInFlight());
 
@@ -382,9 +552,208 @@ public final class WebServer {
         out.put("policy", pol);
         out.put("models", ai);
         out.put("web", web);
-        out.put("how_to_change", "Edit policy.yaml (rules) or the QW_* environment variables (models), then restart "
-                + "`querywarden serve`. Settings can't be changed from the page.");
+        out.put("live", liveStatus.get());
+        out.put("how_to_change", Boolean.TRUE.equals(liveStatus.get().get("enabled"))
+                ? "Edit policy.yaml and it is picked up within 30 seconds, as are new tables or columns in the database. "
+                        + "Model settings (QW_* variables) need a restart. Nothing can be changed from this page."
+                : "Edit policy.yaml (rules) or the QW_* environment variables (models), then restart `querywarden serve`. "
+                        + "Settings can't be changed from the page.");
         json(ctx, 200, out);
+    }
+
+    /**
+     * A short, anonymous id for the database and schema the page is looking at, so the browser can keep
+     * recent questions per database. A hash, so it reveals nothing about the connection.
+     */
+    String databaseId(Runtime rt) {
+        try {
+            String key;
+            try (var c = agentConnections.getConnection()) {
+                key = c.getMetaData().getURL() + "|" + rt.policy().schema();
+            }
+            return UserStore.sha256(key).substring(0, 12);
+        } catch (Exception e) {
+            return "default";
+        }
+    }
+
+    /** Asks Claude for a new set of example questions (counts against the same per-person limit). */
+    private void refreshExamples(Context ctx) {
+        if (exampleRefresher == null) {
+            json(ctx, 404, failed("Example questions come from policy.yaml here, so they can't be refreshed."));
+            return;
+        }
+        if (!allow(limitKey(ctx))) {
+            json(ctx, 429, failed("Too many requests. Please wait a moment."));
+            return;
+        }
+        Examples e = exampleRefresher.get();
+        json(ctx, 200, Map.of("examples", e.questions(), "examples_source", e.source()));
+    }
+
+    // ------------------------------------------------------------------ feedback and verified answers
+    private volatile FeedbackStore feedback = null;
+
+    /** Where "Correct" / "Wrong" feedback is kept (null: feedback is off). */
+    public WebServer withFeedback(FeedbackStore store) {
+        this.feedback = store;
+        return this;
+    }
+
+    /** Locally the one user is the owner and reviews; when shared, only people added with --reviewer. */
+    private boolean isReviewer(Context ctx) {
+        if (!options.sharing()) return true;
+        Object user = ctx.attribute("user");
+        return user != null && options.users().isReviewer(user.toString());
+    }
+
+    private static String who(Context ctx) {
+        Object user = ctx.attribute("user");
+        return user == null ? "local user" : user.toString();
+    }
+
+    /** Reads a small JSON body; replies with an error and returns null if it isn't one. */
+    private JsonNode jsonBody(Context ctx) {
+        String type = ctx.contentType() == null ? "" : ctx.contentType().toLowerCase(Locale.ROOT);
+        if (!type.startsWith("application/json")) {
+            json(ctx, 415, failed("Send JSON."));
+            return null;
+        }
+        try {
+            JsonNode b = JSON.readTree(ctx.body());
+            if (b == null || !b.isObject()) throw new IllegalArgumentException();
+            return b;
+        } catch (Exception e) {
+            json(ctx, 400, failed("Expected a JSON object."));
+            return null;
+        }
+    }
+
+    private static String text(JsonNode b, String key, int max) {
+        JsonNode n = b.get(key);
+        if (n == null || n.isNull()) return "";
+        if (!n.isTextual() || n.asText().length() > max) throw new IllegalArgumentException(key);
+        return n.asText();
+    }
+
+    private void giveFeedback(Context ctx) throws Exception {
+        if (feedback == null) { json(ctx, 404, failed("Feedback is turned off.")); return; }
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        if (!allow(limitKey(ctx))) { json(ctx, 429, failed("Too many requests. Please wait a moment.")); return; }
+        Policy policy = runtime.get().policy();
+        try {
+            String rating = text(b, "rating", 10);
+            String question = text(b, "question", policy.maxQuestionChars());
+            if (question.isBlank()) throw new IllegalArgumentException("question");
+            var item = feedback.add(who(ctx), question, text(b, "interpreted_question", policy.maxQuestionChars()),
+                    text(b, "sql", policy.maxSqlChars()), rating, text(b, "comment", FeedbackStore.MAX_COMMENT_CHARS));
+            json(ctx, 200, Map.of("status", "ok", "id", item.id()));
+        } catch (IllegalArgumentException e) {
+            json(ctx, 400, failed("Feedback needs a question and a rating of up or down."));
+        }
+    }
+
+    private boolean requireReviewer(Context ctx) {
+        if (isReviewer(ctx)) return true;
+        json(ctx, 403, failed("Only reviewers can do this."));
+        return false;
+    }
+
+    private void review(Context ctx) throws Exception {
+        if (!requireReviewer(ctx)) return;
+        Runtime rt = runtime.get();
+        List<Map<String, Object>> open = new ArrayList<>();
+        if (feedback != null) {
+            for (var i : feedback.open()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id", i.id());
+                m.put("at", i.at());
+                m.put("user", i.user());
+                m.put("question", i.question());
+                m.put("interpreted_question", i.interpreted());
+                m.put("sql", i.sql());
+                m.put("rating", i.rating());
+                m.put("comment", i.comment());
+                open.add(m);
+            }
+        }
+        List<Map<String, Object>> verified = new ArrayList<>();
+        if (rt.verified() != null) {
+            for (var a : rt.verified().list()) {
+                verified.add(Map.of("id", a.id(), "question", a.question(), "sql", a.sql(), "verified_by", a.verifiedBy(),
+                        "verified_at", a.verifiedAt(), "notes", a.notes()));
+            }
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("feedback", open);
+        out.put("verified", verified);
+        out.put("verified_file", rt.verified() == null ? null : rt.verified().file().getFileName().toString());
+        json(ctx, 200, out);
+    }
+
+    /** Runs SQL through the usual checks and the read-only user, for reviewers editing an answer. */
+    private void trySql(Context ctx) throws Exception {
+        if (!requireReviewer(ctx)) return;
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        Runtime rt = runtime.get();
+        try {
+            var vq = new SqlValidator(rt.policy()).validate(text(b, "sql", rt.policy().maxSqlChars()));
+            var qr = new SafeExecutor(agentConnections, rt.policy()).execute(vq.sql());
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("status", "ok");
+            out.put("sql", vq.sql());
+            out.put("columns", qr.columns());
+            out.put("rows", qr.rows().subList(0, Math.min(20, qr.rows().size())));
+            out.put("row_count", qr.rows().size());
+            json(ctx, 200, out);
+        } catch (SqlValidator.ValidationException | SafeExecutor.ExecutionException e) {
+            json(ctx, 200, Map.of("status", "rejected", "message", e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            json(ctx, 400, failed("SQL is missing or too long."));
+        }
+    }
+
+    /** Saves a question and its SQL as verified (after checking that the SQL passes and runs). */
+    private void verify(Context ctx) throws Exception {
+        if (!requireReviewer(ctx)) return;
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        Runtime rt = runtime.get();
+        if (rt.verified() == null) { json(ctx, 404, failed("Verified answers aren't available here.")); return; }
+        try {
+            String question = text(b, "question", rt.policy().maxQuestionChars());
+            String sql = text(b, "sql", rt.policy().maxSqlChars());
+            if (question.isBlank() || sql.isBlank()) throw new IllegalArgumentException();
+            var vq = new SqlValidator(rt.policy()).validate(sql);
+            new SafeExecutor(agentConnections, rt.policy()).execute(vq.sql());
+            var saved = rt.verified().add(question, sql, who(ctx), text(b, "notes", 500));
+            String fid = text(b, "feedback_id", 40);
+            if (!fid.isBlank() && feedback != null) feedback.resolve(fid, "verified", who(ctx));
+            json(ctx, 200, Map.of("status", "ok", "id", saved.id()));
+        } catch (SqlValidator.ValidationException | SafeExecutor.ExecutionException e) {
+            json(ctx, 200, Map.of("status", "rejected", "message", "Not saved: " + e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            json(ctx, 400, failed("A verified answer needs a question and its SQL."));
+        }
+    }
+
+    private void dismiss(Context ctx) throws Exception {
+        if (!requireReviewer(ctx)) return;
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        boolean ok = feedback != null && feedback.resolve(text(b, "feedback_id", 40), "dismissed", who(ctx));
+        json(ctx, ok ? 200 : 404, ok ? Map.of("status", "ok") : failed("No such feedback."));
+    }
+
+    private void removeVerified(Context ctx) throws Exception {
+        if (!requireReviewer(ctx)) return;
+        JsonNode b = jsonBody(ctx);
+        if (b == null) return;
+        Runtime rt = runtime.get();
+        boolean ok = rt.verified() != null && rt.verified().remove(text(b, "id", 40));
+        json(ctx, ok ? 200 : 404, ok ? Map.of("status", "ok") : failed("No such verified answer."));
     }
 
     /** Sliding one-minute window per client. */
@@ -403,6 +772,9 @@ public final class WebServer {
         out.put("message", r.message());
         out.put("sql", r.sql());
         out.put("explanation", r.explanation());
+        out.put("interpreted_question", r.interpretedQuestion() == null ? "" : r.interpretedQuestion());
+        out.put("verified", r.verified() == null ? null
+                : Map.of("kind", r.verified().kind(), "questions", r.verified().questions()));
         List<Map<String, String>> columns = new ArrayList<>();
         if (r.result() != null) {
             for (int i = 0; i < r.result().columns().size(); i++)

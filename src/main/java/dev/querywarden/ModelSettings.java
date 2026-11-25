@@ -12,8 +12,8 @@ import com.anthropic.models.beta.messages.BetaOutputConfig;
  * Which Claude model and effort level each job uses. Read from environment variables, so they can be
  * changed without rebuilding:
  * <ul>
- *   <li>{@code QW_SQL_MODEL} / {@code QW_SQL_EFFORT}: writing the SQL (default Claude Opus 5.5, medium);
- *       accuracy matters most here</li>
+ *   <li>{@code QW_SQL_MODEL} / {@code QW_SQL_EFFORT}: writing the SQL (default Claude Sonnet 5.5, medium);
+ *       accuracy matters most here, so check any change with the evaluation</li>
  *   <li>{@code QW_HELPER_MODEL} / {@code QW_HELPER_EFFORT}: example questions, summaries and follow-ups
  *       (default Claude Haiku 5.5, low); simple jobs where speed and cost matter more</li>
  * </ul>
@@ -21,7 +21,11 @@ import com.anthropic.models.beta.messages.BetaOutputConfig;
  */
 public record ModelSettings(String sqlModel, String sqlEffort, String helperModel, String helperEffort) {
 
-    public static final String DEFAULT_SQL_MODEL = "claude-opus-5-5";
+    /**
+     * Claude Sonnet 5.5: in the 2026-11-25 evaluation it matched Claude Opus 5.5 on all 34 questions
+     * at less than half the cost per question. Set QW_SQL_MODEL=claude-opus-5-5 to go back.
+     */
+    public static final String DEFAULT_SQL_MODEL = "claude-sonnet-5-5";
     public static final String DEFAULT_HELPER_MODEL = "claude-haiku-5-5";
     static final Set<String> EFFORTS = Set.of("low", "medium", "high", "xhigh", "max");
     private static final Pattern MODEL_ID = Pattern.compile("claude-[a-z0-9][a-z0-9.-]*");

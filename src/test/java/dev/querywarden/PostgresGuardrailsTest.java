@@ -50,6 +50,20 @@ class PostgresGuardrailsTest {
         assertTrue(schema.contains("FK customer_id -> customers.id"), schema);
     }
 
+    @Test
+    void categoryValuesOnlyWhenAllowedAndNeverPersonalData() throws Exception {
+        assertFalse(Database.describeSchema(cfg, POLICY).contains("values:"), "off by default");
+        Policy on = Policy.parse("share_category_values: true", "test");
+        String schema = Database.describeSchema(cfg, on);
+        assertTrue(schema.contains("country text  -- values: BR, CA, DE"), schema);
+        assertTrue(schema.contains("values: cancelled, delivered, pending, shipped"), schema);
+        assertFalse(schema.contains("Mia Dubois"), "customer names are not categories");
+        assertFalse(schema.contains("example.com"), "emails are never listed");
+        assertFalse(schema.contains("Engineering, Marketing") && schema.contains("Kenji"), "employee names are not listed");
+        Policy masked = Policy.parse("share_category_values: true\nmasked_columns: [country]", "test");
+        assertFalse(Database.describeSchema(cfg, masked).contains("BR, CA, DE"), "masked columns are never listed");
+    }
+
     // ------------------------------------------------------------------ executor
     @Test
     void runsQueryAndMasksPii() throws Exception {
@@ -269,6 +283,63 @@ class PostgresGuardrailsTest {
         SqlGenerator crashing = system -> text -> { throw new IllegalStateException("boom-internal"); };
         var res2 = agent(crashing, null).ask("orders per status");
         assertFalse(res2.message().contains("boom-internal"), res2.message());
+    }
+
+    // ------------------------------------------------------------------ verified answers
+    @Test
+    void sameQuestionIsAnsweredFromVerifiedSqlWithoutClaude(@TempDir Path dir) throws Exception {
+        VerifiedAnswers lib = new VerifiedAnswers(dir.resolve("v.json"));
+        lib.add("How many orders are there per status?", "SELECT status, COUNT(*) AS n FROM orders GROUP BY status", "ann", "");
+        var gen = new FakeGenerator();   // no scripted answers: any Claude call would fail the test
+        var res = agent(gen, null).withVerified(lib).ask("how many orders per status");
+        assertEquals(QueryWardenAgent.Status.OK, res.status());
+        assertEquals(4, res.result().rows().size());
+        assertEquals("same", res.verified().kind());
+        assertEquals(0, res.usage().calls(), "no Claude call");
+        assertTrue(gen.userTurns.isEmpty());
+    }
+
+    @Test
+    void similarVerifiedAnswersAreShownToClaude(@TempDir Path dir) throws Exception {
+        VerifiedAnswers lib = new VerifiedAnswers(dir.resolve("v.json"));
+        String verifiedSql = "SELECT status, COUNT(*) AS n FROM orders GROUP BY status";
+        lib.add("How many orders are there per status?", verifiedSql, "ann", "");
+        var gen = new FakeGenerator(ok(verifiedSql));
+        var res = agent(gen, null).withVerified(lib).ask("How many orders per status, by count?");
+        assertTrue(gen.userTurns.get(0).contains("<verified_examples>"), gen.userTurns.get(0));
+        assertTrue(gen.userTurns.get(0).contains(verifiedSql));
+        assertEquals("reused", res.verified().kind(), "Claude reused the verified SQL");
+
+        var gen2 = new FakeGenerator(ok("SELECT status FROM orders GROUP BY status"));
+        var res2 = agent(gen2, null).withVerified(lib).ask("How many orders per status, by count?");
+        assertEquals("guided", res2.verified().kind());
+    }
+
+    @Test
+    void followUpsAndOutdatedVerifiedAnswersFallBackToClaude(@TempDir Path dir) throws Exception {
+        VerifiedAnswers lib = new VerifiedAnswers(dir.resolve("v.json"));
+        lib.add("orders per status", "SELECT status, COUNT(*) FROM orders GROUP BY status", "ann", "");
+        lib.add("average salary", "SELECT AVG(salary) FROM employees", "ann", "");   // no longer allowed by the policy
+
+        var earlier = List.of(new QueryWardenAgent.Turn("orders in 2024", "SELECT 1 FROM orders"));
+        var gen = new FakeGenerator(ok("SELECT status, COUNT(*) FROM orders GROUP BY status"));
+        agent(gen, null).withVerified(lib).ask("and orders per status", "cli", p -> { }, earlier);
+        assertEquals(1, gen.userTurns.size(), "a follow-up (\"and …\") goes to Claude, with the conversation as context");
+
+        var gen3 = new FakeGenerator();
+        var standalone = agent(gen3, null).withVerified(lib).ask("Orders per status?", "cli", p -> { }, earlier);
+        assertEquals("same", standalone.verified().kind(), "a question that stands on its own uses the verified answer mid-conversation too");
+        assertTrue(gen3.userTurns.isEmpty());
+
+        for (String q : List.of("now only Germany", "same for 2024", "what about those customers?", "And per month"))
+            assertTrue(QueryWardenAgent.looksLikeFollowUp(q), q);
+        for (String q : List.of("Total revenue in 2025", "How many orders per status?", "Top 5 products by sales"))
+            assertFalse(QueryWardenAgent.looksLikeFollowUp(q), q);
+
+        var gen2 = new FakeGenerator(new SqlGenerator.Output(false, "", "", "Salary isn't available."));
+        var res = agent(gen2, null).withVerified(lib).ask("average salary");
+        assertEquals(QueryWardenAgent.Status.UNANSWERABLE, res.status(), "the outdated verified SQL is not run");
+        assertTrue(res.attempts().stream().anyMatch(a -> a.status().equals("verified_skipped")));
     }
 
     @Test

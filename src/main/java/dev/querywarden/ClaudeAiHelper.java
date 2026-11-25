@@ -77,9 +77,16 @@ public final class ClaudeAiHelper implements AiHelper {
 
     @Override
     public List<String> suggestExamples(String schemaText, int count) {
+        return suggestExamples(schemaText, count, List.of());
+    }
+
+    @Override
+    public List<String> suggestExamples(String schemaText, int count, List<String> avoid) {
         try {
+            String avoidText = avoid.isEmpty() ? ""
+                    : "\n\nAsk about different things than these earlier examples:\n- " + String.join("\n- ", avoid);
             JsonNode out = call(EXAMPLES_SYSTEM,
-                    "<schema>\n" + schemaText + "\n</schema>\n\nSuggest " + count + " example questions.",
+                    "<schema>\n" + schemaText + "\n</schema>" + avoidText + "\n\nSuggest " + count + " example questions.",
                     Map.of("type", "object",
                             "properties", Map.of("questions", Map.of("type", "array", "items", Map.of("type", "string"))),
                             "required", List.of("questions"),

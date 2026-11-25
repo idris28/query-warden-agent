@@ -27,7 +27,10 @@
       </section>
 
       <section class="side-block">
+        <p id="whoami" class="whoami" hidden>Signed in as <strong id="whoami-name"></strong></p>
+        <button id="review-open" class="secondary" type="button" hidden>Review</button>
         <button id="settings-open" class="secondary" type="button">Settings</button>
+        <button id="sign-out" class="link-button" type="button" hidden>Sign out</button>
       </section>
     </aside>
 
@@ -39,11 +42,13 @@
                   placeholder="Which customers spent the most last year?"></textarea>
         <div class="ask-row">
           <button id="ask-button" type="submit" class="primary">Ask</button>
+          <button id="new-conversation" type="button" class="secondary" hidden>New conversation</button>
           <span class="hint">Enter to ask, Shift+Enter for a new line</span>
         </div>
         <div class="examples" id="examples-wrap" hidden>
           <span class="examples-label" id="examples-label">Try</span>
           <ul id="examples" class="examples-list" aria-labelledby="examples-label"></ul>
+          <button id="more-examples" type="button" class="link-button more-examples" hidden>More examples</button>
         </div>
       </form>
 
@@ -52,6 +57,8 @@
 
       <article id="answer" class="answer" hidden aria-live="polite">
         <h1 id="answer-question" class="answer-question"></h1>
+        <p id="answer-interpreted" class="answer-interpreted" hidden></p>
+        <p id="answer-verified" class="answer-verified" hidden></p>
         <p id="answer-summary" class="answer-summary"></p>
         <p id="answer-insight" class="answer-insight" hidden></p>
         <p id="answer-message" class="answer-message" hidden></p>
@@ -99,14 +106,58 @@
 
         <ul id="warnings" class="warnings" hidden></ul>
 
+        <div id="feedback" class="feedback" hidden>
+          <span class="feedback-label">Was this answer right?</span>
+          <button id="fb-up" type="button" class="secondary">Correct</button>
+          <button id="fb-down" type="button" class="secondary">Wrong</button>
+          <button id="fb-verify" type="button" class="secondary" hidden>Mark as verified</button>
+          <div id="fb-comment-wrap" class="fb-comment" hidden>
+            <label for="fb-comment">What's wrong? (optional, helps the reviewer)</label>
+            <textarea id="fb-comment" rows="2" maxlength="1000"></textarea>
+            <button id="fb-send" type="button" class="primary">Send</button>
+          </div>
+          <p id="fb-done" class="quiet" role="status" hidden></p>
+        </div>
+
         <section id="next" class="next" hidden aria-labelledby="next-heading">
           <h2 id="next-heading">Ask next</h2>
           <ul id="next-list"></ul>
         </section>
 
       </article>
+
+      <section id="earlier" class="earlier" hidden aria-labelledby="earlier-heading">
+        <h2 id="earlier-heading">Earlier in this conversation</h2>
+        <ol id="earlier-list"></ol>
+      </section>
     </main>
   </div>
+
+  <dialog id="signin" class="settings signin" aria-labelledby="signin-heading">
+    <form id="signin-form" method="dialog">
+      <h2 id="signin-heading">Sign in to QueryWarden</h2>
+      <p class="quiet">This page is shared. Paste the access token you were given.</p>
+      <label for="signin-token" class="ask-label">Access token</label>
+      <input id="signin-token" type="password" autocomplete="off" spellcheck="false" required>
+      <p id="signin-error" class="signin-error" role="alert" hidden></p>
+      <div class="ask-row">
+        <button type="submit" class="primary">Sign in</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="review" class="settings review" aria-labelledby="review-heading">
+    <div class="settings-head">
+      <h2 id="review-heading">Review</h2>
+      <button id="review-close" class="secondary" type="button">Close</button>
+    </div>
+    <p class="quiet">Check answers people marked, fix the SQL if needed, and save good ones as verified answers.
+      The same question is then answered from its verified SQL, and similar ones use it as an example.</p>
+    <h3>Feedback to review</h3>
+    <div id="review-feedback"><p class="quiet">Loading…</p></div>
+    <h3>Verified answers <span id="review-file" class="quiet"></span></h3>
+    <div id="review-verified"></div>
+  </dialog>
 
   <dialog id="settings" class="settings" aria-labelledby="settings-heading">
     <div class="settings-head">

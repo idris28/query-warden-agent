@@ -5,7 +5,8 @@
 
 (function () {
   const $ = (id) => document.getElementById(id);
-  const RECENT_KEY = "querywarden.recent";
+  // Recent questions are kept per database (the server gives each one an anonymous id).
+  let RECENT_KEY = "querywarden.recent";
   const RECENT_MAX = 12;
 
   const form = $("ask-form");
@@ -44,6 +45,72 @@
     statusEl.classList.toggle("is-error", isError);
   }
 
+  // ------------------------------------------------------------------ sign-in (only when the page is shared)
+  // The token lives in this tab's sessionStorage: it is forgotten when the tab closes.
+  const TOKEN_KEY = "querywarden.token";
+  let signedInHook = null;
+
+  function token() {
+    try { return sessionStorage.getItem(TOKEN_KEY); } catch { return null; }
+  }
+
+  function setToken(t) {
+    try { if (t) sessionStorage.setItem(TOKEN_KEY, t); else sessionStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+  }
+
+  // fetch() for the API: adds the access token, and asks for sign-in when the server says so.
+  async function api(url, opts = {}) {
+    const headers = Object.assign({}, opts.headers || {});
+    const t = token();
+    if (t) headers.Authorization = "Bearer " + t;
+    const res = await fetch(url, Object.assign({}, opts, { headers }));
+    if (res.status === 401) {
+      let msg = "Sign in with your access token.";
+      try { const j = await res.clone().json(); if (j && j.message) msg = j.message; } catch { /* ignore */ }
+      showSignIn(t ? msg : "");
+    }
+    return res;
+  }
+
+  function showSignIn(message) {
+    const d = $("signin");
+    $("signin-error").textContent = message || "";
+    show($("signin-error"), Boolean(message));
+    if (!d.open) d.showModal();
+    $("signin-token").focus();
+  }
+
+  $("signin").addEventListener("cancel", (e) => e.preventDefault());   // sign-in can't be skipped
+  $("signin-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    setToken($("signin-token").value.trim());
+    $("signin-token").value = "";
+    const res = await api("/api/me");
+    if (res.ok) {
+      $("signin").close();
+      if (signedInHook) signedInHook();
+    }
+  });
+
+  $("sign-out").addEventListener("click", () => { setToken(null); location.reload(); });
+
+  async function whoAmI() {
+    try {
+      const res = await api("/api/me");
+      if (!res.ok) return false;
+      const me = await res.json();
+      canReview = Boolean(me.reviewer);
+      feedbackOn = Boolean(me.feedback);
+      show($("review-open"), canReview && feedbackOn);
+      if (me.sharing && me.name) {
+        $("whoami-name").textContent = me.name;
+        show($("whoami"), true);
+        show($("sign-out"), true);
+      }
+      return true;
+    } catch { return false; }
+  }
+
   // ------------------------------------------------------------------ recent questions (this browser only)
   function loadRecent() {
     try {
@@ -79,18 +146,56 @@
   $("recent-clear").addEventListener("click", () => { saveRecent([]); renderRecent(); });
 
   // ------------------------------------------------------------------ available data + examples
-  async function loadSchema() {
+  let schemaSnapshot = "";
+
+  // Loads the tables and example questions. Called again every minute: when the server has picked up a
+  // change to policy.yaml or the database, the page follows without a reload.
+  async function loadSchema(quiet = false) {
     try {
-      const res = await fetch("/api/schema", { headers: { Accept: "application/json" } });
+      const res = await api("/api/schema", { headers: { Accept: "application/json" } });
       if (!res.ok) throw new Error();
       const data = await res.json();
+      const snapshot = JSON.stringify([data.tables, data.examples, data.database_id]);
+      if (snapshot === schemaSnapshot) return;
+      const firstLoad = schemaSnapshot === "";
+      schemaSnapshot = snapshot;
       renderTables(data.tables || []);
       renderExamples(data.examples || []);
+      show($("more-examples"), Boolean(data.examples_refreshable));
       if (data.max_question_chars) input.maxLength = data.max_question_chars;
+      if (data.database_id) {
+        RECENT_KEY = "querywarden.recent." + data.database_id;
+        try {   // one-time move of questions saved before recent lists were kept per database
+          const legacy = localStorage.getItem("querywarden.recent");
+          if (legacy && !localStorage.getItem(RECENT_KEY)) localStorage.setItem(RECENT_KEY, legacy);
+          localStorage.removeItem("querywarden.recent");
+        } catch { /* ignore */ }
+        renderRecent();
+      }
+      if (!firstLoad && quiet) setStatus("The available data or example questions changed; the lists are up to date.");
     } catch {
-      $("tables").replaceChildren(el("p", { className: "quiet", text: "Couldn't load the list of tables. Is the database running?" }));
+      if (!quiet) $("tables").replaceChildren(el("p", { className: "quiet", text: "Couldn't load the list of tables. Is the database running?" }));
     }
   }
+
+  setInterval(() => { if (!document.hidden && !busy) loadSchema(true); }, 60_000);
+
+  $("more-examples").addEventListener("click", async () => {
+    const b = $("more-examples");
+    b.disabled = true;
+    b.textContent = "Thinking of more…";
+    try {
+      const res = await api("/api/examples/refresh", { method: "POST", headers: { Accept: "application/json" } });
+      const data = await res.json();
+      if (res.ok && Array.isArray(data.examples)) renderExamples(data.examples);
+      else setStatus(data.message || "Couldn't get more examples.", true);
+    } catch {
+      setStatus("Couldn't get more examples.", true);
+    } finally {
+      b.disabled = false;
+      b.textContent = "More examples";
+    }
+  });
 
   function renderTables(tables) {
     const wrap = $("tables");
@@ -119,6 +224,66 @@
   function renderExamples(examples) {
     $("examples").replaceChildren(...examples.map((q) => el("li", {}, [questionButton(q)])));
     show($("examples-wrap"), examples.length > 0);
+  }
+
+  // ------------------------------------------------------------------ conversation memory and earlier answers
+  // Answered questions of this conversation, sent with the next question so follow-ups like
+  // "now only Germany" work. Kept in this page only; "New conversation" or a reload clears it.
+  const conversation = [];
+  const EARLIER_MAX = 10;
+
+  function updateConversationUi() {
+    show($("new-conversation"), conversation.length > 0);
+    input.placeholder = conversation.length > 0
+      ? "Ask a follow-up, e.g. “now only for 2024”, or a new question"
+      : "Which customers spent the most last year?";
+  }
+
+  $("new-conversation").addEventListener("click", () => {
+    conversation.length = 0;
+    $("earlier-list").replaceChildren();
+    show($("earlier"), false);
+    show($("answer"), false);
+    if (chart) { chart.destroy(); chart = null; }
+    view.data = null;
+    updateConversationUi();
+    setStatus("Started a new conversation.");
+    input.focus();
+  });
+
+  // Moves the answer on screen into "Earlier in this conversation" as a read-only copy.
+  function archiveCurrentAnswer() {
+    if (!view.data || $("answer").hidden) return;
+    const copy = $("answer").cloneNode(true);
+    // The chart becomes a picture (a copied canvas would be blank).
+    const canvas = copy.querySelector("canvas");
+    if (canvas) {
+      if (chart && !$("chart-wrap").hidden) {
+        const img = el("img", { className: "chart-image" });
+        img.src = chart.toBase64Image();
+        img.alt = $("chart-caption").textContent;
+        canvas.closest("figure").replaceWith(img);
+      } else {
+        canvas.closest("figure").remove();
+      }
+    }
+    // Controls only work on the current answer; ids must stay unique.
+    for (const sel of [".chart-controls", ".table-tools", "#next", "#progress", "#feedback"]) {
+      copy.querySelectorAll(sel).forEach((n) => n.remove());
+    }
+    copy.removeAttribute("id");
+    copy.querySelectorAll("[id]").forEach((n) => n.removeAttribute("id"));
+    copy.classList.remove("is-fresh");
+    copy.removeAttribute("aria-live");
+
+    const summary = el("summary", {}, [
+      el("span", { className: "earlier-q", text: view.question }),
+      el("span", { className: "earlier-meta", text: $("answer-summary").textContent }),
+    ]);
+    const item = el("li", {}, [el("details", {}, [summary, copy])]);
+    $("earlier-list").prepend(item);
+    while ($("earlier-list").children.length > EARLIER_MAX) $("earlier-list").lastElementChild.remove();
+    show($("earlier"), true);
   }
 
   // ------------------------------------------------------------------ live progress
@@ -163,10 +328,10 @@
 
     let gotResult = false;
     try {
-      const res = await fetch("/api/ask/stream", {
+      const res = await api("/api/ask/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, history: conversation.slice(-3) }),
       });
       const type = res.headers.get("Content-Type") || "";
       if (!res.ok || !type.includes("ndjson")) {
@@ -187,7 +352,12 @@
           progress.finish();
           remember(question);
           input.value = "";
+          archiveCurrentAnswer();
           renderAnswer(question, event);
+          if (event.status === "ok" && event.sql) {
+            conversation.push({ question: event.interpreted_question || question, sql: event.sql });
+            updateConversationUi();
+          }
         } else if (event.type === "insights") {
           renderInsights(event);
         }
@@ -235,6 +405,10 @@
     const answer = $("answer");
     show(answer, true);   // visible before drawing, so the chart can measure its space
     $("answer-question").textContent = question;
+    const understood = (data.interpreted_question || "").trim();
+    const same = understood.toLowerCase().replace(/[?.!\s]+$/, "") === question.toLowerCase().replace(/[?.!\s]+$/, "");
+    $("answer-interpreted").textContent = understood && !same ? "Understood as: " + understood : "";
+    show($("answer-interpreted"), Boolean(understood) && !same);
     const msg = $("answer-message");
     const ok = data.status === "ok";
 
@@ -262,6 +436,8 @@
     renderChart();
     renderWarnings(ok ? data.warnings || [] : []);
     renderHow(data);
+    renderVerifiedBadge(data);
+    renderFeedback(data);
 
     answer.classList.remove("is-fresh");
     void answer.offsetWidth; // restart the one entrance animation
@@ -585,12 +761,172 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   });
 
+  // ------------------------------------------------------------------ feedback and verified answers
+  let canReview = false;
+  let feedbackOn = false;
+  let lastFeedbackId = "";   // feedback just given on the answer on screen
+
+  function renderVerifiedBadge(data) {
+    const p = $("answer-verified");
+    const v = data.verified;
+    if (!v || data.status !== "ok") { show(p, false); return; }
+    const label = v.kind === "same" ? "Verified answer"
+      : v.kind === "reused" ? "Matches a verified answer" : "Based on similar verified answers";
+    p.textContent = label;
+    p.title = "Verified question" + (v.questions.length > 1 ? "s" : "") + ": " + v.questions.join(" | ");
+    p.classList.toggle("is-guided", v.kind === "guided");
+    show(p, true);
+  }
+
+  function renderFeedback(data) {
+    show($("feedback"), feedbackOn && Boolean(view.question));
+    for (const id of ["fb-up", "fb-down"]) { $(id).disabled = false; $(id).setAttribute("aria-pressed", "false"); }
+    show($("fb-comment-wrap"), false);
+    $("fb-comment").value = "";
+    show($("fb-done"), false);
+    const v = data.verified;
+    lastFeedbackId = "";
+    show($("fb-verify"), canReview && data.status === "ok" && Boolean(data.sql) && !(v && v.kind === "same"));
+    $("fb-verify").disabled = false;
+  }
+
+  async function sendFeedback(rating, comment) {
+    const d = view.data;
+    try {
+      const res = await api("/api/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ question: view.question, interpreted_question: d.interpreted_question || "",
+          sql: d.sql || "", rating, comment: comment || "" }),
+      });
+      const j = await res.json();
+      if (res.ok && j.id) lastFeedbackId = j.id;
+      $("fb-done").textContent = res.ok
+        ? (rating === "up" ? "Thanks, noted." : "Thanks. A reviewer will look at it.") : (j.message || "Couldn't send feedback.");
+    } catch {
+      $("fb-done").textContent = "Couldn't send feedback.";
+    }
+    show($("fb-done"), true);
+    for (const id of ["fb-up", "fb-down"]) $(id).disabled = true;
+  }
+
+  $("fb-up").addEventListener("click", () => { $("fb-up").setAttribute("aria-pressed", "true"); sendFeedback("up"); });
+  $("fb-down").addEventListener("click", () => {
+    $("fb-down").setAttribute("aria-pressed", "true");
+    show($("fb-comment-wrap"), true);
+    $("fb-comment").focus();
+  });
+  $("fb-send").addEventListener("click", () => { show($("fb-comment-wrap"), false); sendFeedback("down", $("fb-comment").value); });
+
+  async function postJson(url, body) {
+    const res = await api(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+    let j = {};
+    try { j = await res.json(); } catch { /* ignore */ }
+    return { ok: res.ok && j.status === "ok", data: j };
+  }
+
+  $("fb-verify").addEventListener("click", async () => {
+    const d = view.data;
+    $("fb-verify").disabled = true;
+    const r = await postJson("/api/review/verify", { question: d.interpreted_question || view.question, sql: d.sql, notes: "",
+      feedback_id: lastFeedbackId });
+    $("fb-done").textContent = r.ok ? "Saved as a verified answer. The same question will now get this answer straight away."
+      : (r.data.message || "Couldn't save it.");
+    show($("fb-done"), true);
+  });
+
+  // The review panel (reviewers only)
+  const reviewDialog = $("review");
+  $("review-open").addEventListener("click", () => { reviewDialog.showModal(); loadReview(); });
+  $("review-close").addEventListener("click", () => reviewDialog.close());
+
+  async function loadReview() {
+    try {
+      const res = await api("/api/review", { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error();
+      renderReview(await res.json());
+    } catch {
+      $("review-feedback").replaceChildren(el("p", { className: "quiet", text: "Couldn't load the review list." }));
+    }
+  }
+
+  function renderReview(r) {
+    $("review-file").textContent = r.verified_file ? "(" + r.verified_file + ")" : "";
+    $("review-open").textContent = r.feedback.length ? "Review (" + r.feedback.length + ")" : "Review";
+    $("review-feedback").replaceChildren(...(r.feedback.length ? r.feedback.map(reviewItem)
+      : [el("p", { className: "quiet", text: "Nothing to review. Feedback from “Correct” and “Wrong” appears here." })]));
+    $("review-verified").replaceChildren(...(r.verified.length ? r.verified.map(verifiedItem)
+      : [el("p", { className: "quiet", text: "None yet." })]));
+  }
+
+  function reviewItem(f) {
+    const box = el("div", { className: "review-item" });
+    const question = el("input", { className: "review-question" });
+    question.value = f.interpreted_question || f.question;
+    question.setAttribute("aria-label", "Question to save");
+    const sql = el("textarea", {});
+    sql.value = f.sql || "";
+    sql.setAttribute("aria-label", "SQL");
+    const result = el("p", { className: "review-result" });
+    const tryBtn = el("button", { text: "Try", type: "button", className: "secondary" });
+    const verifyBtn = el("button", { text: "Verify", type: "button", className: "secondary" });
+    const dismissBtn = el("button", { text: "Dismiss", type: "button", className: "secondary" });
+    tryBtn.addEventListener("click", async () => {
+      const r = await postJson("/api/review/try", { sql: sql.value });
+      result.classList.toggle("is-error", !r.ok);
+      result.textContent = r.ok
+        ? r.data.row_count + " row(s). First rows:\n" + r.data.columns.join(" | ") + "\n"
+          + r.data.rows.slice(0, 5).map((row) => row.map((v) => (v === null ? "—" : String(v))).join(" | ")).join("\n")
+        : (r.data.message || "Rejected.");
+    });
+    verifyBtn.addEventListener("click", async () => {
+      const r = await postJson("/api/review/verify", { question: question.value, sql: sql.value, notes: f.comment || "", feedback_id: f.id });
+      result.classList.toggle("is-error", !r.ok);
+      result.textContent = r.ok ? "Saved as a verified answer." : (r.data.message || "Couldn't save it.");
+      if (r.ok) setTimeout(loadReview, 700);
+    });
+    dismissBtn.addEventListener("click", async () => {
+      const r = await postJson("/api/review/dismiss", { feedback_id: f.id });
+      if (r.ok) loadReview();
+    });
+    box.append(
+      el("p", { className: "review-q", text: f.question }),
+      el("p", { className: "review-meta" }, [
+        el("span", { className: f.rating === "down" ? "is-down" : "is-up", text: f.rating === "down" ? "Marked wrong" : "Marked correct" }),
+        document.createTextNode(" by " + f.user + ", " + new Date(f.at).toLocaleString()),
+      ]),
+      ...(f.comment ? [el("p", { className: "review-comment", text: "“" + f.comment + "”" })] : []),
+      question, sql,
+      el("div", { className: "review-actions" }, [tryBtn, verifyBtn, dismissBtn]),
+      result,
+    );
+    return box;
+  }
+
+  function verifiedItem(v) {
+    const removeBtn = el("button", { text: "Remove", type: "button", className: "secondary" });
+    removeBtn.addEventListener("click", async () => {
+      const r = await postJson("/api/review/remove", { id: v.id });
+      if (r.ok) loadReview();
+    });
+    return el("div", { className: "review-item" }, [
+      el("p", { className: "review-q", text: v.question }),
+      el("p", { className: "review-meta", text: "Verified by " + (v.verified_by || "someone") + ", " + new Date(v.verified_at).toLocaleString() }),
+      el("pre", { text: v.sql }),
+      el("div", { className: "review-actions" }, [removeBtn]),
+    ]);
+  }
+
   // ------------------------------------------------------------------ read-only settings
   const settingsDialog = $("settings");
   $("settings-open").addEventListener("click", async () => {
     settingsDialog.showModal();
     try {
-      const res = await fetch("/api/settings", { headers: { Accept: "application/json" } });
+      const res = await api("/api/settings", { headers: { Accept: "application/json" } });
       if (!res.ok) throw new Error();
       renderSettings(await res.json());
     } catch {
@@ -630,12 +966,27 @@
         ["Examples, summaries, follow-ups", m.helper_enabled ? m.helper_model + " (" + m.helper_effort + " effort)" : "off"],
         ["Result rows shared with AI", p.share_results_with_ai ? "Yes: up to 50 rows per answer, after masking" : "No: results stay on this computer",
           p.share_results_with_ai ? "is-on" : ""],
+        ["Category values shared with AI", p.share_category_values ? "Yes: short category lists such as country codes"
+          : "No", p.share_category_values ? "is-on" : ""],
         ["Example questions from", exampleSource],
+      ]),
+      el("h3", { text: "Live updates" }),
+      rows([
+        ["Picks up changes", s.live && s.live.enabled
+          ? "Yes: policy.yaml and the database are checked every 30 seconds" : "No: restart to apply changes"],
+        ...(s.live && s.live.last_change ? [["Last change", new Date(s.live.last_change).toLocaleString() + " (" + s.live.last_change_reason + ")"]] : []),
+        ...(s.live && s.live.last_error ? [["Problem", s.live.last_error, "is-on"]] : []),
         ["Refusal fallback", m.refusal_fallback_sql ? "on for SQL writing" : "off"],
       ]),
+      el("h3", { text: "Business definitions" }),
+      Object.keys(p.definitions || {}).length
+        ? rows(Object.entries(p.definitions).map(([term, meaning]) => [term, meaning]))
+        : el("p", { className: "quiet", text: "None. Add a definitions section to policy.yaml so terms like revenue always mean the same thing." }),
       el("h3", { text: "Web page" }),
       rows([
-        ["Address", w.address + (w.local_only ? " (this computer only)" : "")],
+        ["Address", w.address + (w.local_only ? " (this computer only)"
+          : " (shared: sign-in required, " + w.people + (w.people === 1 ? " person)" : " people)"))],
+        ...(w.signed_in_as ? [["Signed in as", w.signed_in_as]] : []),
         ["Usage limits", w.questions_per_minute + " questions per minute, " + w.questions_at_once + " at once"],
       ]),
     );
@@ -644,6 +995,9 @@
 
   // ------------------------------------------------------------------ start
   renderRecent();
-  loadSchema();
-  input.focus();
+  async function startPage() {
+    if (await whoAmI()) { loadSchema(); input.focus(); }
+  }
+  signedInHook = startPage;
+  startPage();
 })();
