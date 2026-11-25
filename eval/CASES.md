@@ -14,8 +14,8 @@ Generated from `eval/cases.yaml` by `querywarden eval --list`. 61 questions.
 | e08-out-of-stock | easy | answer |  | 1 |
 | m01-top5-customers-delivered | medium | answer | yes | 1 |
 | m02-revenue-by-category-excl-cancelled | medium | answer |  | 1 |
-| m03-monthly-orders-2025 | medium | answer | yes | 1 |
-| m04-top3-products-units | medium | answer | yes | 1 |
+| m03-monthly-orders-2025 | medium | answer | yes | 2 |
+| m04-top3-products-units | medium | answer | yes | 2 |
 | m05-never-delivered | medium | answer |  | 1 |
 | m06-revenue-by-country-excl-cancelled | medium | answer |  | 1 |
 | m07-cancelled-share | medium | answer |  | 1 |
@@ -25,7 +25,7 @@ Generated from `eval/cases.yaml` by `querywarden eval --list`. 61 questions.
 | h01-best-month-2025 | hard | answer |  | 1 |
 | h02-customers-both-years | hard | answer |  | 1 |
 | h03-repeat-customers | hard | answer |  | 1 |
-| h04-median-order-value | hard | answer |  | 1 |
+| h04-median-order-value | hard | answer |  | 2 |
 | h05-category-cancellation-rate | hard | answer | yes | 1 |
 | h06-top-category-per-country | hard | answer |  | 1 |
 | def01-sales-2025 | definitions | answer |  | 1 |
@@ -197,12 +197,19 @@ WHERE o.status <> 'cancelled' GROUP BY p.category
 How many orders were placed in each month of 2025, in month order?
 ````
 
-Reference:
+Acceptable reading 1:
 
 ````sql
 SELECT date_trunc('month', order_date) AS month, COUNT(*)
 FROM orders WHERE order_date >= DATE '2025-01-01' AND order_date < DATE '2026-01-01'
 GROUP BY 1 ORDER BY 1
+````
+
+Acceptable reading 2:
+
+````sql
+SELECT m, COUNT(o.id) FROM generate_series(DATE '2025-01-01', DATE '2025-12-01', INTERVAL '1 month') AS m
+LEFT JOIN orders o ON o.order_date >= m AND o.order_date < m + INTERVAL '1 month' GROUP BY m ORDER BY m
 ````
 
 ## m04-top3-products-units
@@ -211,10 +218,18 @@ GROUP BY 1 ORDER BY 1
 Which 3 products sold the most units across all orders? Show product name and units.
 ````
 
-Reference:
+Acceptable reading 1:
 
 ````sql
 SELECT p.name, SUM(oi.quantity) AS units FROM order_items oi JOIN products p ON p.id = oi.product_id
+GROUP BY p.id, p.name ORDER BY units DESC LIMIT 3
+````
+
+Acceptable reading 2:
+
+````sql
+SELECT p.name, SUM(oi.quantity) AS units FROM order_items oi JOIN products p ON p.id = oi.product_id
+JOIN orders o ON o.id = oi.order_id WHERE o.status <> 'cancelled'
 GROUP BY p.id, p.name ORDER BY units DESC LIMIT 3
 ````
 
@@ -341,11 +356,19 @@ SELECT COUNT(*) FROM (SELECT customer_id FROM orders GROUP BY customer_id HAVING
 What is the median order value across all orders, where order value is the sum of quantity times unit price of its items? Round to 2 decimals.
 ````
 
-Reference:
+Acceptable reading 1:
 
 ````sql
 SELECT ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY v)::numeric, 2) FROM (
   SELECT order_id, SUM(quantity * unit_price) AS v FROM order_items GROUP BY order_id) t
+````
+
+Acceptable reading 2:
+
+````sql
+SELECT ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY v)::numeric, 2) FROM (
+  SELECT oi.order_id, SUM(oi.quantity * oi.unit_price) AS v FROM order_items oi
+  JOIN orders o ON o.id = oi.order_id WHERE o.status <> 'cancelled' GROUP BY oi.order_id) t
 ````
 
 ## h05-category-cancellation-rate

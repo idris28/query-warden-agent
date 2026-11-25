@@ -1,13 +1,42 @@
+# Build output
 target/
+bin/
+dependency-reduced-pom.xml
+
+# Local data: never commit
+# - every question asked, with who asked
 audit.jsonl
-.DS_Store
-.vscode/
-# evaluation output: keep results, skip bulky or regenerated files
+# - "Correct" / "Wrong" feedback
+feedback.jsonl
+# - access-token fingerprints for the shared page
+users.json
+# - output of `querywarden grants`, holds a password once edited
+grants.sql
+# - secrets
+.env
+.env.*
+# - cache of Claude-written example questions
+.querywarden/
+
+# Temporary files
+*.tmp
+*.log
+
+# Evaluation output: keep results, skip bulky or regenerated files
 .claude/hillclimb/**/traces/
 .claude/hillclimb/**/report.html
 .claude/hillclimb/**/trajectory/
-users.json
-users.json.tmp
-.querywarden/
-feedback.jsonl
-*.verified.json.tmp
+
+# Personal Claude Code settings
+.claude/settings.local.json
+
+# Editors and OS
+.vscode/
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+.factorypath
+.DS_Store
+Thumbs.db

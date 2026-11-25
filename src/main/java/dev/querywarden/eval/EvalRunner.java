@@ -204,6 +204,12 @@ public final class EvalRunner {
 
     /** Writes the questions as markdown, for review. */
     static void writeCaseList(List<EvalCase> cases, Path out) throws IOException {
+        Files.writeString(out, caseListMarkdown(cases));
+        System.out.println("Wrote " + out);
+    }
+
+    /** The readable list of questions (eval/CASES.md), generated from eval/cases.yaml. */
+    static String caseListMarkdown(List<EvalCase> cases) {
         StringBuilder sb = new StringBuilder("# Evaluation questions\n\n")
                 .append("Generated from `eval/cases.yaml` by `querywarden eval --list`. ")
                 .append(cases.size()).append(" questions.\n\n")
@@ -224,8 +230,7 @@ public final class EvalRunner {
             }
             if (c.decline()) sb.append("\nMust be declined, with no restricted data returned.\n");
         }
-        Files.writeString(out, sb.toString());
-        System.out.println("Wrote " + out);
+        return sb.toString();
     }
 
     /** The grader must give ~100% to the references themselves and 0% to an empty answer. */
